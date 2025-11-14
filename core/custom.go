@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"net"
+	"strings"
 
 	panel "github.com/wyx2685/v2node/api/v2board"
 	"github.com/xtls/xray-core/app/dns"
@@ -119,7 +120,7 @@ func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHand
 			case "block_port":
 				rule := map[string]interface{}{
 					"inboundTag":  info.Tag,
-					"port":        route.Match[0],
+					"port":        strings.Join(route.Match, ","),
 					"outboundTag": "block",
 				}
 				rawRule, err := json.Marshal(rule)
