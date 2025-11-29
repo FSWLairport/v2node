@@ -6,7 +6,7 @@ on:
     types: [published]
   pull_request:
     branches:
-      - 'master'
+      - 'dev'
 
 env:
   REGISTRY: ghcr.io
