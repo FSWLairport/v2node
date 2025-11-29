@@ -55,11 +55,33 @@ type CommonNode struct {
 	//anytls
 	PaddingScheme []string `json:"padding_scheme,omitempty"`
 	//hysteria hysteria2
-	UpMbps                  int    `json:"up_mbps"`
-	DownMbps                int    `json:"down_mbps"`
-	Obfs                    string `json:"obfs"`
-	ObfsPassword            string `json:"obfs-password"`
-	Ignore_Client_Bandwidth bool   `json:"ignore_client_bandwidth"`
+	UpMbps                  int            `json:"up_mbps"`
+	DownMbps                int            `json:"down_mbps"`
+	Obfs                    string         `json:"obfs"`
+	ObfsPassword            string         `json:"obfs-password"`
+	Ignore_Client_Bandwidth bool           `json:"ignore_client_bandwidth"`
+	SatlsSettings           *SatlsSettings `json:"satls_settings"`
+}
+
+type SatlsTLS struct {
+	ServerName string `json:"server_name"`
+}
+
+type SatlsSplitHalf struct {
+	Host string   `json:"host"`
+	TLS  SatlsTLS `json:"tls"`
+}
+
+type SatlsSplit struct {
+	Up   *SatlsSplitHalf `json:"up"`
+	Down *SatlsSplitHalf `json:"down"`
+}
+
+type SatlsSettings struct {
+	AllowInsecure interface{} `json:"allow_insecure"`
+	Host          string      `json:"host"`
+	Mode          string      `json:"mode"`
+	Split         *SatlsSplit `json:"split"`
 }
 
 type Route struct {
@@ -151,7 +173,7 @@ func (c *Client) GetNodeInfo() (node *NodeInfo, err error) {
 		return nil, fmt.Errorf("decode node params error: %s", err)
 	}
 	switch cm.Protocol {
-	case "vmess", "trojan", "hysteria2", "tuic", "anytls", "vless":
+	case "vmess", "trojan", "hysteria2", "tuic", "anytls", "vless", "satls":
 		node.Type = cm.Protocol
 		node.Security = cm.Tls
 	case "shadowsocks":
