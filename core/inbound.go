@@ -8,11 +8,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	panel "github.com/wyx2685/v2node/api/v2board"
+	"github.com/wyx2685/v2node/proxy/satls"
+	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
 	coreConf "github.com/xtls/xray-core/infra/conf"
@@ -45,6 +50,7 @@ func (v *V2Core) addInbound(config *core.InboundHandlerConfig) error {
 func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerConfig, error) {
 	in := &coreConf.InboundDetourConfig{}
 	var err error
+	isSatls := false
 	switch nodeInfo.Type {
 	case "vless":
 		err = buildVLess(nodeInfo, in)
@@ -60,6 +66,9 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 		err = buildTuic(nodeInfo, in)
 	case "anytls":
 		err = buildAnyTLS(nodeInfo, in)
+	case "satls":
+		err = buildSATLS(nodeInfo, in)
+		isSatls = true
 	default:
 		return nil, fmt.Errorf("unsupported node type: %s", nodeInfo.Type)
 	}
@@ -141,6 +150,9 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 		break
 	}
 	in.Tag = tag
+	if isSatls {
+		return buildSATLSInbound(nodeInfo, in)
+	}
 	return in.Build()
 }
 
@@ -437,4 +449,123 @@ func buildAnyTLS(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig
 		return fmt.Errorf("marshal anytls settings error: %s", err)
 	}
 	return nil
+}
+
+func buildSATLS(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig) error {
+	inbound.Protocol = "satls"
+	t := coreConf.TransportProtocol("tcp")
+	inbound.StreamSetting = &coreConf.StreamConfig{Network: &t}
+	empty := json.RawMessage([]byte("{}"))
+	inbound.Settings = (*json.RawMessage)(&empty)
+	return nil
+}
+
+func buildSATLSInbound(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig) (*core.InboundHandlerConfig, error) {
+	receiverSettings := &proxyman.ReceiverConfig{}
+	if inbound.ListenOn == nil {
+		if inbound.PortList == nil {
+			return nil, fmt.Errorf("satls: missing port")
+		}
+		receiverSettings.PortList = inbound.PortList.Build()
+	} else {
+		receiverSettings.Listen = inbound.ListenOn.Build()
+		listenDS := inbound.ListenOn.Family().IsDomain() && (filepath.IsAbs(inbound.ListenOn.Domain()) || inbound.ListenOn.Domain()[0] == '@')
+		listenIP := inbound.ListenOn.Family().IsIP() || (inbound.ListenOn.Family().IsDomain() && inbound.ListenOn.Domain() == "localhost")
+		if listenIP {
+			if inbound.PortList == nil {
+				return nil, fmt.Errorf("satls: missing port for listen IP")
+			}
+			receiverSettings.PortList = inbound.PortList.Build()
+		} else if listenDS {
+			if inbound.PortList != nil {
+				receiverSettings.PortList = nil
+			}
+		} else {
+			return nil, fmt.Errorf("satls: unable to listen on domain %s", inbound.ListenOn.Domain())
+		}
+	}
+	if inbound.StreamSetting != nil {
+		ss, err := inbound.StreamSetting.Build()
+		if err != nil {
+			return nil, err
+		}
+		receiverSettings.StreamSettings = ss
+	}
+	if inbound.SniffingConfig != nil {
+		s, err := inbound.SniffingConfig.Build()
+		if err != nil {
+			return nil, err
+		}
+		receiverSettings.SniffingSettings = s
+	}
+	// SATLS-specific TLS/SNI selection
+	certInfo := nodeInfo.Common.CertInfo
+	if certInfo == nil {
+		return nil, fmt.Errorf("satls: missing cert info")
+	}
+	serverName := nodeInfo.Common.TlsSettings.ServerName
+	upServerName := serverName
+	downServerName := serverName
+	rejectUnknown := certInfo.RejectUnknownSni
+	if st := nodeInfo.Common.SatlsSettings; st != nil {
+		allowInsecure := parseBoolLoose(st.AllowInsecure)
+		if st.Host != "" {
+			serverName = st.Host
+		}
+		if st.Split != nil {
+			if st.Split.Up != nil {
+				if st.Split.Up.TLS.ServerName != "" {
+					upServerName = st.Split.Up.TLS.ServerName
+				} else if st.Split.Up.Host != "" {
+					upServerName = st.Split.Up.Host
+				}
+			}
+			if st.Split.Down != nil {
+				if st.Split.Down.TLS.ServerName != "" {
+					downServerName = st.Split.Down.TLS.ServerName
+				} else if st.Split.Down.Host != "" {
+					downServerName = st.Split.Down.Host
+				}
+			}
+		}
+		if allowInsecure {
+			rejectUnknown = false
+		}
+	}
+	return &core.InboundHandlerConfig{
+		Tag:              inbound.Tag,
+		ReceiverSettings: serial.ToTypedMessage(receiverSettings),
+		ProxySettings: serial.ToTypedMessage(&satls.ServerConfig{
+			CertFile:         certInfo.CertFile,
+			KeyFile:          certInfo.KeyFile,
+			ServerName:       serverName,
+			UpServerName:     upServerName,
+			DownServerName:   downServerName,
+			RejectUnknownSni: rejectUnknown,
+		}),
+	}, nil
+}
+
+func parseBoolLoose(v interface{}) bool {
+	switch val := v.(type) {
+	case nil:
+		return false
+	case bool:
+		return val
+	case string:
+		lower := strings.ToLower(strings.TrimSpace(val))
+		return lower == "true" || lower == "1" || lower == "yes" || lower == "on"
+	case int:
+		return val != 0
+	case int64:
+		return val != 0
+	case float64:
+		return val != 0
+	default:
+		// try strconv on fmt
+		if s, ok := val.(fmt.Stringer); ok {
+			return parseBoolLoose(s.String())
+		}
+		return false
+	}
 }

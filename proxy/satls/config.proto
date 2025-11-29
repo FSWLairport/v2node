@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package v2node.proxy.satls;
+option go_package = "github.com/wyx2685/v2node/proxy/satls";
+
+import "common/protocol/user.proto";
+
+// Account binds a SATLS path token to a user.
+message Account {
+  string path = 1;
+}
+
+// ServerConfig carries the SATLS inbound users.
+message ServerConfig {
+  repeated xray.common.protocol.User users = 1;
+  string path_salt = 2;
+  string cert_file = 3;
+  string key_file = 4;
+  string server_name = 5;
+  bool reject_unknown_sni = 6;
+  string up_server_name = 7;
+  string down_server_name = 8;
+}

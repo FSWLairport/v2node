@@ -11,6 +11,7 @@ import (
 	"github.com/wyx2685/v2node/common/counter"
 	"github.com/wyx2685/v2node/common/format"
 	"github.com/wyx2685/v2node/core/app/dispatcher"
+	"github.com/wyx2685/v2node/proxy/satls"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/infra/conf"
@@ -131,6 +132,8 @@ func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
 		users = buildTuicUsers(p.Tag, p.Users)
 	case "anytls":
 		users = buildAnyTLSUsers(p.Tag, p.Users)
+	case "satls":
+		users = buildSATLSUsers(p.Tag, p.Users)
 	default:
 		return 0, fmt.Errorf("unsupported node type: %s", p.NodeInfo.Type)
 	}
@@ -322,5 +325,27 @@ func buildAnyTLSUser(tag string, userInfo *panel.UserInfo) (user *protocol.User)
 		Level:   0,
 		Email:   format.UserTag(tag, userInfo.Uuid),
 		Account: serial.ToTypedMessage(anyTLSAccount),
+	}
+}
+
+func buildSATLSUsers(tag string, infos []panel.UserInfo) []*protocol.User {
+	users := make([]*protocol.User, len(infos))
+	for i := range infos {
+		users[i] = buildSATLSUser(tag, &infos[i])
+	}
+	return users
+}
+
+func buildSATLSUser(tag string, info *panel.UserInfo) *protocol.User {
+	path := strings.TrimSpace(info.Uuid)
+	path = strings.Trim(path, "/")
+	if path == "" {
+		path = fmt.Sprintf("uid-%d", info.Id)
+	}
+	account := &satls.Account{Path: strings.ToLower(path)}
+	return &protocol.User{
+		Level:   0,
+		Email:   format.UserTag(tag, info.Uuid),
+		Account: serial.ToTypedMessage(account),
 	}
 }
