@@ -16,3 +16,4 @@ output/*
 .idea/*
 new.sh
 quick_update.sh
+build_assets/

@@ -78,6 +78,8 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 			ForceAttemptHTTP2:   true,
 			TLSClientConfig: &tls.Config{
 				MinVersion: tls.VersionTLS13,
+				MaxVersion: tls.VersionTLS13,
+				NextProtos: []string{"h2", "http/1.1"},
 			},
 		},
 	}
@@ -102,8 +104,13 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		acc.Path = token
 	}
 	s.store.Store(&userStoreSnapshot{users: users, emailIndex: emails})
-	if config.CertFile == "" || config.KeyFile == "" {
-		return nil, stderrs.New("satls: missing certificate")
+	if config.CertFile == "" || config.KeyFile == "" || !fileExists(config.CertFile) || !fileExists(config.KeyFile) {
+		if config.CertFile == "" || config.KeyFile == "" {
+			return nil, stderrs.New("satls: missing certificate path")
+		}
+		if err := generateSelfSigned(s.serverName, config.CertFile, config.KeyFile); err != nil {
+			return nil, err
+		}
 	}
 	cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
 	if err != nil {
@@ -155,7 +162,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 			_ = writeSwitchingProtocols(conn, "VersionMismatch")
 			s.writeErrorResponse(conn, http.StatusUpgradeRequired, "VersionMismatch")
 		} else {
-			s.handleFallback(ctx, conn, req, body, err)
+			s.handleFallback(ctx, conn, req, body, s.fallbackHost(nil))
 		}
 		return err
 	}
@@ -209,14 +216,14 @@ type handshakeRequest struct {
 	version   string
 }
 
-func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Request, body []byte, reason error) {
+func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Request, body []byte, targetHost string) {
 	if req.Body != nil {
 		req.Body.Close()
 	}
 	if len(body) > 0 {
 		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	if err := s.proxyFallback(ctx, conn, req); err != nil {
+	if err := s.proxyFallback(ctx, conn, req, targetHost); err != nil {
 		s.sleepFallbackDelay()
 		s.writeErrorResponse(conn, http.StatusBadRequest, "")
 	}
@@ -287,7 +294,7 @@ func (s *Server) findUser(path string) *protocol.MemoryUser {
 
 func (s *Server) handleFull(ctx context.Context, conn net.Conn, info *handshakeRequest, dispatcher routing.Dispatcher) error {
 	if !s.replay.Reserve(info.sessionID) {
-		s.writeErrorResponse(conn, http.StatusTooManyRequests, "session reuse")
+		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info))
 		return stderrs.New("satls: duplicate session id")
 	}
 	// FULL 链路返回 101
@@ -302,7 +309,7 @@ func (s *Server) handleSplitUp(ctx context.Context, conn net.Conn, info *handsha
 		return stderrs.New("satls: reconnect on up link")
 	}
 	if !s.replay.Reserve(info.sessionID) {
-		s.writeErrorResponse(conn, http.StatusTooManyRequests, "session reuse")
+		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info))
 		return stderrs.New("satls: duplicate session id")
 	}
 	session := newSplitSession(info.sessionID, info.user, conn)
@@ -339,9 +346,10 @@ func (s *Server) handleSplitDown(ctx context.Context, conn net.Conn, info *hands
 	session, ok := s.splitSessions[info.sessionID]
 	s.sessionsMu.Unlock()
 	if !ok {
-		s.writeErrorResponse(conn, http.StatusNotFound, "session not found")
+		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info))
 		return stderrs.New("satls: unknown session")
 	}
+	// reconnect allowed, handled by attachDown
 	status, errAttach := session.attachDown(conn, info.reconnect)
 	if errAttach != nil {
 		s.writeErrorResponse(conn, http.StatusConflict, errAttach.Error())
@@ -763,34 +771,47 @@ func (c *splitConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *http.Request) error {
-	host := req.Host
+func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *http.Request, targetHost string) error {
+	host := targetHost
 	if host == "" {
-		host = req.URL.Host
+		host = req.Host
+		if host == "" {
+			host = req.URL.Host
+		}
 	}
 	if host == "" {
 		return stderrs.New("satls: fallback host missing")
 	}
-	// Ensure host has no scheme
-	if strings.HasPrefix(host, "https://") || strings.HasPrefix(host, "http://") {
-		parsed, err := url.Parse(host)
-		if err == nil {
-			host = parsed.Host
-		}
+	// resolve target host to IP and connect directly
+	ipAddrs, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil || len(ipAddrs) == 0 {
+		return stderrs.New("satls: fallback resolve failed")
 	}
+	ip := ipAddrs[0].String()
 	forwardURL := &url.URL{Scheme: "https", Host: host, Path: "/"}
 	forwardReq, err := http.NewRequestWithContext(ctx, http.MethodGet, forwardURL.String(), nil)
 	if err != nil {
 		return err
 	}
+	forwardReq.Host = host
 	// try to mimic browser-ish TLS/headers
 	forwardReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	forwardReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
 	forwardReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	if forwardReq.Header.Get("Connection") == "" {
-		forwardReq.Header.Set("Connection", "close")
+	forwardReq.Header.Set("Connection", "close")
+
+	transport := *s.fallbackClient.Transport.(*http.Transport)
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
 	}
-	resp, err := s.fallbackClient.Do(forwardReq)
+	transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	transport.TLSClientConfig.MinVersion = tls.VersionTLS13
+	transport.TLSClientConfig.MaxVersion = tls.VersionTLS13
+	transport.TLSClientConfig.ServerName = host
+	client := &http.Client{Timeout: s.fallbackClient.Timeout, Transport: &transport}
+
+	resp, err := client.Do(forwardReq)
 	if err != nil {
 		return err
 	}
@@ -799,11 +820,11 @@ func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *ht
 	if _, err := fmt.Fprintf(bufferedWriter, "HTTP/1.1 %s\r\n", resp.Status); err != nil {
 		return err
 	}
-		headers := resp.Header.Clone()
-		headers.Set("Connection", "close")
-		if err := headers.Write(bufferedWriter); err != nil {
-			return err
-		}
+	headers := resp.Header.Clone()
+	headers.Set("Connection", "close")
+	if err := headers.Write(bufferedWriter); err != nil {
+		return err
+	}
 	if _, err := bufferedWriter.WriteString("\r\n"); err != nil {
 		return err
 	}
@@ -820,3 +841,13 @@ func (s *Server) sleepFallbackDelay() {
 
 // errVersionMismatch signals S-Version mismatch for 426 handling.
 var errVersionMismatch = stderrs.New("satls: version mismatch")
+
+func (s *Server) fallbackHost(info *handshakeRequest) string {
+	if info != nil && info.mode == linkModeUp && s.upServerName != "" {
+		return s.upServerName
+	}
+	if info != nil && info.mode == linkModeDown && s.downServerName != "" {
+		return s.downServerName
+	}
+	return s.serverName
+}

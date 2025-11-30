@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -57,6 +58,14 @@ func parseLinkMode(value string) (linkMode, error) {
 
 func normalizePathToken(v string) string {
 	return strings.ToLower(strings.Trim(strings.TrimSpace(v), "/"))
+}
+
+func fileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func hashPath(token string) [32]byte {
