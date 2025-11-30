@@ -78,6 +78,10 @@ type ServerConfig struct {
 	RejectUnknownSni bool                   `protobuf:"varint,6,opt,name=reject_unknown_sni,json=rejectUnknownSni,proto3" json:"reject_unknown_sni,omitempty"`
 	UpServerName     string                 `protobuf:"bytes,7,opt,name=up_server_name,json=upServerName,proto3" json:"up_server_name,omitempty"`
 	DownServerName   string                 `protobuf:"bytes,8,opt,name=down_server_name,json=downServerName,proto3" json:"down_server_name,omitempty"`
+	UpCertFile       string                 `protobuf:"bytes,9,opt,name=up_cert_file,json=upCertFile,proto3" json:"up_cert_file,omitempty"`
+	UpKeyFile        string                 `protobuf:"bytes,10,opt,name=up_key_file,json=upKeyFile,proto3" json:"up_key_file,omitempty"`
+	DownCertFile     string                 `protobuf:"bytes,11,opt,name=down_cert_file,json=downCertFile,proto3" json:"down_cert_file,omitempty"`
+	DownKeyFile      string                 `protobuf:"bytes,12,opt,name=down_key_file,json=downKeyFile,proto3" json:"down_key_file,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -168,13 +172,41 @@ func (x *ServerConfig) GetDownServerName() string {
 	return ""
 }
 
+func (x *ServerConfig) GetUpCertFile() string {
+	if x != nil {
+		return x.UpCertFile
+	}
+	return ""
+}
+
+func (x *ServerConfig) GetUpKeyFile() string {
+	if x != nil {
+		return x.UpKeyFile
+	}
+	return ""
+}
+
+func (x *ServerConfig) GetDownCertFile() string {
+	if x != nil {
+		return x.DownCertFile
+	}
+	return ""
+}
+
+func (x *ServerConfig) GetDownKeyFile() string {
+	if x != nil {
+		return x.DownKeyFile
+	}
+	return ""
+}
+
 var File_proxy_satls_config_proto protoreflect.FileDescriptor
 
 const file_proxy_satls_config_proto_rawDesc = "" +
 	"\n" +
 	"\x18proxy/satls/config.proto\x12\x12v2node.proxy.satls\x1a\x1acommon/protocol/user.proto\"\x1d\n" +
 	"\aAccount\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04path\"\xb4\x02\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\"\xc0\x03\n" +
 	"\fServerConfig\x120\n" +
 	"\x05users\x18\x01 \x03(\v2\x1a.xray.common.protocol.UserR\x05users\x12\x1b\n" +
 	"\tpath_salt\x18\x02 \x01(\tR\bpathSalt\x12\x1b\n" +
@@ -184,7 +216,13 @@ const file_proxy_satls_config_proto_rawDesc = "" +
 	"serverName\x12,\n" +
 	"\x12reject_unknown_sni\x18\x06 \x01(\bR\x10rejectUnknownSni\x12$\n" +
 	"\x0eup_server_name\x18\a \x01(\tR\fupServerName\x12(\n" +
-	"\x10down_server_name\x18\b \x01(\tR\x0edownServerNameB'Z%github.com/wyx2685/v2node/proxy/satlsb\x06proto3"
+	"\x10down_server_name\x18\b \x01(\tR\x0edownServerName\x12 \n" +
+	"\fup_cert_file\x18\t \x01(\tR\n" +
+	"upCertFile\x12\x1e\n" +
+	"\vup_key_file\x18\n" +
+	" \x01(\tR\tupKeyFile\x12$\n" +
+	"\x0edown_cert_file\x18\v \x01(\tR\fdownCertFile\x12\"\n" +
+	"\rdown_key_file\x18\f \x01(\tR\vdownKeyFileB'Z%github.com/wyx2685/v2node/proxy/satlsb\x06proto3"
 
 var (
 	file_proxy_satls_config_proto_rawDescOnce sync.Once

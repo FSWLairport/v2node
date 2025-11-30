@@ -531,6 +531,12 @@ func buildSATLSInbound(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetour
 			rejectUnknown = false
 		}
 	}
+	// per-link cert paths (fixed pattern if present)
+	tagID := nodeInfo.Id
+	upCert := fmt.Sprintf("/etc/v2node/satls%d-up.cer", tagID)
+	upKey := fmt.Sprintf("/etc/v2node/satls%d-up.key", tagID)
+	downCert := fmt.Sprintf("/etc/v2node/satls%d-down.cer", tagID)
+	downKey := fmt.Sprintf("/etc/v2node/satls%d-down.key", tagID)
 	return &core.InboundHandlerConfig{
 		Tag:              inbound.Tag,
 		ReceiverSettings: serial.ToTypedMessage(receiverSettings),
@@ -541,6 +547,10 @@ func buildSATLSInbound(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetour
 			UpServerName:     upServerName,
 			DownServerName:   downServerName,
 			RejectUnknownSni: rejectUnknown,
+			UpCertFile:      upCert,
+			UpKeyFile:       upKey,
+			DownCertFile:    downCert,
+			DownKeyFile:     downKey,
 		}),
 	}, nil
 }

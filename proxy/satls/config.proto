@@ -20,4 +20,8 @@ message ServerConfig {
   bool reject_unknown_sni = 6;
   string up_server_name = 7;
   string down_server_name = 8;
+  string up_cert_file = 9;
+  string up_key_file = 10;
+  string down_cert_file = 11;
+  string down_key_file = 12;
 }

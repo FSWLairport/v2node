@@ -168,3 +168,10 @@ func readDestinationMetadata(r io.Reader) (xnet.Destination, error) {
 	}
 	return xnet.TCPDestination(address, xnet.Port(port)), nil
 }
+
+func sniMatches(sni, expected string) bool {
+	if expected == "" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(sni), strings.TrimSpace(expected))
+}
