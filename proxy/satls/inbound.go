@@ -150,16 +150,22 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 		s.sleepFallbackDelay()
 		return err
 	}
+	fallbackTarget := sni
+	if fallbackTarget == "" {
+		fallbackTarget = s.fallbackHost(nil)
+	}
 	conn = tlsConn
 	reader := bufio.NewReader(conn)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
+		s.handleFallback(ctx, conn, nil, nil, fallbackTarget)
 		return err
 	}
 	body, err := io.ReadAll(req.Body)
 	req.Body.Close()
 	if err != nil {
 		s.sleepFallbackDelay()
+		s.handleFallback(ctx, conn, req, nil, fallbackTarget)
 		return err
 	}
 	req.Body = io.NopCloser(bytes.NewReader(body))
@@ -170,7 +176,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 			_ = writeSwitchingProtocols(conn, "VersionMismatch")
 			s.writeErrorResponse(conn, http.StatusUpgradeRequired, "VersionMismatch")
 		} else {
-			s.handleFallback(ctx, conn, req, body, s.fallbackHost(nil))
+			s.handleFallback(ctx, conn, req, body, fallbackTarget)
 		}
 		return err
 	}
@@ -240,11 +246,13 @@ type handshakeRequest struct {
 }
 
 func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Request, body []byte, targetHost string) {
-	if req.Body != nil {
-		req.Body.Close()
-	}
-	if len(body) > 0 {
-		req.Body = io.NopCloser(bytes.NewReader(body))
+	if req != nil {
+		if req.Body != nil {
+			req.Body.Close()
+		}
+		if len(body) > 0 {
+			req.Body = io.NopCloser(bytes.NewReader(body))
+		}
 	}
 	if err := s.proxyFallback(ctx, conn, req, targetHost); err != nil {
 		s.sleepFallbackDelay()
@@ -795,8 +803,8 @@ func (c *splitConn) SetWriteDeadline(t time.Time) error {
 }
 
 func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *http.Request, targetHost string) error {
-	host := targetHost
-	if host == "" {
+	host := strings.TrimSpace(targetHost)
+	if host == "" && req != nil {
 		host = req.Host
 		if host == "" {
 			host = req.URL.Host
