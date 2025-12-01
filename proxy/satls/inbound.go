@@ -154,10 +154,15 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	if fallbackTarget == "" {
 		fallbackTarget = s.fallbackHost(nil)
 	}
+	remoteAddr := conn.RemoteAddr()
 	conn = tlsConn
 	reader := bufio.NewReader(conn)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Info,
+			Content:  fmt.Sprintf("satls fallback: http read request failed: %v remote=%v target=%s", err, remoteAddr, fallbackTarget),
+		})
 		s.handleFallback(ctx, conn, nil, nil, fallbackTarget)
 		return err
 	}
@@ -165,6 +170,10 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	req.Body.Close()
 	if err != nil {
 		s.sleepFallbackDelay()
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Info,
+			Content:  fmt.Sprintf("satls fallback: read body failed: %v remote=%v target=%s", err, remoteAddr, fallbackTarget),
+		})
 		s.handleFallback(ctx, conn, req, nil, fallbackTarget)
 		return err
 	}
@@ -176,6 +185,10 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 			_ = writeSwitchingProtocols(conn, "VersionMismatch")
 			s.writeErrorResponse(conn, http.StatusUpgradeRequired, "VersionMismatch")
 		} else {
+			log.Record(&log.GeneralMessage{
+				Severity: log.Severity_Info,
+				Content:  fmt.Sprintf("satls fallback: validation failed: %v remote=%v target=%s", err, remoteAddr, fallbackTarget),
+			})
 			s.handleFallback(ctx, conn, req, body, fallbackTarget)
 		}
 		return err
