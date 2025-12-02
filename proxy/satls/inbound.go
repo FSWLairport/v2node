@@ -150,10 +150,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 		s.sleepFallbackDelay()
 		return err
 	}
-	fallbackTarget := sni
-	if fallbackTarget == "" {
-		fallbackTarget = s.fallbackHost(nil)
-	}
+	fallbackTarget := s.fallbackHost(nil)
 	remoteAddr := conn.RemoteAddr()
 	conn = tlsConn
 	reader := bufio.NewReader(conn)
@@ -163,9 +160,10 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 			Severity: log.Severity_Info,
 			Content:  fmt.Sprintf("satls fallback: http read request failed: %v remote=%v target=%s", err, remoteAddr, fallbackTarget),
 		})
-		s.handleFallback(ctx, conn, nil, nil, fallbackTarget)
+		s.handleFallback(ctx, conn, nil, nil, fallbackTarget, sni)
 		return err
 	}
+	fallbackTarget = s.pickFallbackTarget(req, sni)
 	body, err := io.ReadAll(req.Body)
 	req.Body.Close()
 	if err != nil {
@@ -174,7 +172,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 			Severity: log.Severity_Info,
 			Content:  fmt.Sprintf("satls fallback: read body failed: %v remote=%v target=%s", err, remoteAddr, fallbackTarget),
 		})
-		s.handleFallback(ctx, conn, req, nil, fallbackTarget)
+		s.handleFallback(ctx, conn, req, nil, fallbackTarget, sni)
 		return err
 	}
 	req.Body = io.NopCloser(bytes.NewReader(body))
@@ -189,7 +187,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 				Severity: log.Severity_Info,
 				Content:  fmt.Sprintf("satls fallback: validation failed: %v remote=%v target=%s", err, remoteAddr, fallbackTarget),
 			})
-			s.handleFallback(ctx, conn, req, body, fallbackTarget)
+			s.handleFallback(ctx, conn, req, body, fallbackTarget, sni)
 		}
 		return err
 	}
@@ -256,9 +254,10 @@ type handshakeRequest struct {
 	mode      linkMode
 	reconnect bool
 	version   string
+	sni       string
 }
 
-func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Request, body []byte, targetHost string) {
+func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Request, body []byte, targetHost string, sni string) {
 	if req != nil {
 		if req.Body != nil {
 			req.Body.Close()
@@ -267,7 +266,7 @@ func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Re
 			req.Body = io.NopCloser(bytes.NewReader(body))
 		}
 	}
-	if err := s.proxyFallback(ctx, conn, req, targetHost); err != nil {
+	if err := s.proxyFallback(ctx, conn, req, targetHost, sni); err != nil {
 		s.sleepFallbackDelay()
 		s.writeErrorResponse(conn, http.StatusBadRequest, "")
 	}
@@ -328,6 +327,7 @@ func (s *Server) validateRequest(req *http.Request, bodyLen int, sni string) (*h
 		mode:      mode,
 		reconnect: reconnect,
 		version:   strings.TrimSpace(req.Header.Get("S-Version")),
+		sni:       sni,
 	}, nil
 }
 
@@ -338,7 +338,7 @@ func (s *Server) findUser(path string) *protocol.MemoryUser {
 
 func (s *Server) handleFull(ctx context.Context, conn net.Conn, info *handshakeRequest, dispatcher routing.Dispatcher) error {
 	if !s.replay.Reserve(info.sessionID) {
-		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info))
+		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni)
 		return stderrs.New("satls: duplicate session id")
 	}
 	// FULL 链路返回 101
@@ -353,7 +353,7 @@ func (s *Server) handleSplitUp(ctx context.Context, conn net.Conn, info *handsha
 		return stderrs.New("satls: reconnect on up link")
 	}
 	if !s.replay.Reserve(info.sessionID) {
-		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info))
+		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni)
 		return stderrs.New("satls: duplicate session id")
 	}
 	session := newSplitSession(info.sessionID, info.user, conn)
@@ -390,7 +390,7 @@ func (s *Server) handleSplitDown(ctx context.Context, conn net.Conn, info *hands
 	session, ok := s.splitSessions[info.sessionID]
 	s.sessionsMu.Unlock()
 	if !ok {
-		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info))
+		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni)
 		return stderrs.New("satls: unknown session")
 	}
 	// reconnect allowed, handled by attachDown
@@ -815,29 +815,39 @@ func (c *splitConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *http.Request, targetHost string) error {
-	host := strings.TrimSpace(targetHost)
-	if host == "" && req != nil {
-		host = req.Host
-		if host == "" {
-			host = req.URL.Host
+func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *http.Request, targetHost string, sni string) error {
+	resolveHost := strings.TrimSpace(targetHost)
+	if resolveHost == "" && req != nil {
+		resolveHost = req.Host
+		if resolveHost == "" && req.URL != nil {
+			resolveHost = req.URL.Host
 		}
 	}
-	if host == "" {
+	if resolveHost == "" {
 		return stderrs.New("satls: fallback host missing")
 	}
+	hostHeader := strings.TrimSpace(sni)
+	if hostHeader == "" && req != nil {
+		hostHeader = strings.TrimSpace(req.Host)
+		if hostHeader == "" && req.URL != nil {
+			hostHeader = strings.TrimSpace(req.URL.Host)
+		}
+	}
+	if hostHeader == "" {
+		hostHeader = resolveHost
+	}
 	// resolve target host to IP and connect directly
-	ipAddrs, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	ipAddrs, err := net.DefaultResolver.LookupIP(ctx, "ip", resolveHost)
 	if err != nil || len(ipAddrs) == 0 {
 		return stderrs.New("satls: fallback resolve failed")
 	}
 	ip := ipAddrs[0].String()
-	forwardURL := &url.URL{Scheme: "https", Host: host, Path: "/"}
+	forwardURL := &url.URL{Scheme: "https", Host: hostHeader, Path: "/"}
 	forwardReq, err := http.NewRequestWithContext(ctx, http.MethodGet, forwardURL.String(), nil)
 	if err != nil {
 		return err
 	}
-	forwardReq.Host = host
+	forwardReq.Host = hostHeader
 	// try to mimic browser-ish TLS/headers
 	forwardReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	forwardReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
@@ -852,7 +862,7 @@ func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *ht
 	transport.TLSClientConfig = transport.TLSClientConfig.Clone()
 	transport.TLSClientConfig.MinVersion = tls.VersionTLS13
 	transport.TLSClientConfig.MaxVersion = tls.VersionTLS13
-	transport.TLSClientConfig.ServerName = host
+	transport.TLSClientConfig.ServerName = hostHeader
 	client := &http.Client{Timeout: s.fallbackClient.Timeout, Transport: &transport}
 
 	resp, err := client.Do(forwardReq)
@@ -887,10 +897,81 @@ func (s *Server) sleepFallbackDelay() {
 var errVersionMismatch = stderrs.New("satls: version mismatch")
 
 func (s *Server) fallbackHost(info *handshakeRequest) string {
-	if info != nil && info.mode == linkModeUp && s.upServerName != "" {
+	if info != nil {
+		switch info.mode {
+		case linkModeUp:
+			if s.upServerName != "" {
+				return s.upServerName
+			}
+			if info.sni != "" {
+				return strings.TrimSpace(info.sni)
+			}
+			return ""
+		case linkModeDown:
+			if s.downServerName != "" {
+				return s.downServerName
+			}
+			if s.upServerName != "" {
+				return s.upServerName
+			}
+			if info.sni != "" {
+				return strings.TrimSpace(info.sni)
+			}
+			return ""
+		}
+	}
+	if split := s.splitDefaultHost(); split != "" {
+		return split
+	}
+	return s.serverName
+}
+
+func (s *Server) pickFallbackTarget(req *http.Request, sni string) string {
+	var target string
+	splitDefault := s.splitDefaultHost()
+	splitConfigured := splitDefault != ""
+	splitted := false
+	if req != nil {
+		if mode, err := parseLinkMode(req.Header.Get("S-Link-Mode")); err == nil {
+			switch mode {
+			case linkModeUp:
+				splitted = true
+				if s.upServerName != "" {
+					target = s.upServerName
+				}
+			case linkModeDown:
+				splitted = true
+				if s.downServerName != "" {
+					target = s.downServerName
+				} else if s.upServerName != "" {
+					target = s.upServerName
+				}
+			}
+		}
+	}
+	if target == "" && splitConfigured {
+		target = splitDefault
+	}
+	if target == "" && req != nil {
+		target = strings.TrimSpace(req.Host)
+		if target == "" && req.URL != nil {
+			target = strings.TrimSpace(req.URL.Host)
+		}
+	}
+	if target == "" {
+		target = strings.TrimSpace(sni)
+	}
+	if target == "" && !splitted && !splitConfigured {
+		target = s.serverName
+	}
+	return target
+}
+
+func (s *Server) splitDefaultHost() string {
+	if s.upServerName != "" {
 		return s.upServerName
 	}
-	if info != nil && info.mode == linkModeDown && s.downServerName != "" {
+	if s.downServerName != "" {
 		return s.downServerName
 	}
 	return s.serverName
