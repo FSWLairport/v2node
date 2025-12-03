@@ -12,7 +12,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,6 +58,23 @@ type Server struct {
 	splitSessions  map[string]*splitSession
 	replay         *sessionIDCache
 	fallbackClient *http.Client
+}
+
+type captureConn struct {
+	net.Conn
+	buf bytes.Buffer
+}
+
+func (c *captureConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		_, _ = c.buf.Write(p[:n])
+	}
+	return n, err
+}
+
+func (c *captureConn) Captured() []byte {
+	return c.buf.Bytes()
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
@@ -122,8 +138,10 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	}
 	tlsConf := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"h2", "http/1.1"},
-		MinVersion:   tls.VersionTLS12,
+		// Only HTTP/1.1 - SATLS protocol uses custom HTTP method which requires HTTP/1.x text format.
+		// HTTP/2 uses binary framing that cannot be parsed by http.ReadRequest.
+		NextProtos: []string{"http/1.1"},
+		MinVersion: tls.VersionTLS12,
 	}
 	s.tlsConfig = tlsConf
 	s.serverName = strings.ToLower(strings.TrimSpace(config.ServerName))
@@ -152,7 +170,12 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	}
 	fallbackTarget := s.fallbackHost(nil)
 	remoteAddr := conn.RemoteAddr()
-	conn = tlsConn
+	capConn := &captureConn{Conn: tlsConn}
+	conn = capConn
+	negProto := ""
+	if tc, ok := tlsConn.(*tls.Conn); ok {
+		negProto = tc.ConnectionState().NegotiatedProtocol
+	}
 	reader := bufio.NewReader(conn)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
@@ -160,7 +183,8 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 			Severity: log.Severity_Info,
 			Content:  fmt.Sprintf("satls fallback: http read request failed: %v remote=%v target=%s", err, remoteAddr, fallbackTarget),
 		})
-		s.handleFallback(ctx, conn, nil, nil, fallbackTarget, sni)
+		_ = conn.SetDeadline(time.Time{})
+		s.handleFallback(ctx, newCachedConn(conn, reader), nil, nil, fallbackTarget, sni, negProto, capConn.Captured())
 		return err
 	}
 	fallbackTarget = s.pickFallbackTarget(req, sni)
@@ -172,7 +196,8 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 			Severity: log.Severity_Info,
 			Content:  fmt.Sprintf("satls fallback: read body failed: %v remote=%v target=%s", err, remoteAddr, fallbackTarget),
 		})
-		s.handleFallback(ctx, conn, req, nil, fallbackTarget, sni)
+		_ = conn.SetDeadline(time.Time{})
+		s.handleFallback(ctx, newCachedConn(conn, reader), req, nil, fallbackTarget, sni, negProto, capConn.Captured())
 		return err
 	}
 	req.Body = io.NopCloser(bytes.NewReader(body))
@@ -187,7 +212,8 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 				Severity: log.Severity_Info,
 				Content:  fmt.Sprintf("satls fallback: validation failed: %v remote=%v target=%s", err, remoteAddr, fallbackTarget),
 			})
-			s.handleFallback(ctx, conn, req, body, fallbackTarget, sni)
+			_ = conn.SetDeadline(time.Time{})
+			s.handleFallback(ctx, newCachedConn(conn, reader), req, body, fallbackTarget, sni, negProto, capConn.Captured())
 		}
 		return err
 	}
@@ -216,6 +242,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 
 func (s *Server) acceptTLS(raw net.Conn) (net.Conn, string, error) {
 	serverConf := s.tlsConfig.Clone()
+	serverConf.NextProtos = []string{"http/1.1"}
 	var clientSNI string
 	serverConf.GetConfigForClient = func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
 		clientSNI = ch.ServerName
@@ -257,7 +284,8 @@ type handshakeRequest struct {
 	sni       string
 }
 
-func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Request, body []byte, targetHost string, sni string) {
+func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Request, body []byte, targetHost string, sni string, negotiatedProto string, prefetched []byte) {
+	_ = conn.SetDeadline(time.Time{})
 	if req != nil {
 		if req.Body != nil {
 			req.Body.Close()
@@ -266,7 +294,7 @@ func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Re
 			req.Body = io.NopCloser(bytes.NewReader(body))
 		}
 	}
-	if err := s.proxyFallback(ctx, conn, req, targetHost, sni); err != nil {
+	if err := s.proxyFallback(ctx, conn, req, targetHost, sni, negotiatedProto, prefetched); err != nil {
 		s.sleepFallbackDelay()
 		s.writeErrorResponse(conn, http.StatusBadRequest, "")
 	}
@@ -338,7 +366,7 @@ func (s *Server) findUser(path string) *protocol.MemoryUser {
 
 func (s *Server) handleFull(ctx context.Context, conn net.Conn, info *handshakeRequest, dispatcher routing.Dispatcher) error {
 	if !s.replay.Reserve(info.sessionID) {
-		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni)
+		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni, "", nil)
 		return stderrs.New("satls: duplicate session id")
 	}
 	// FULL 链路返回 101
@@ -353,7 +381,7 @@ func (s *Server) handleSplitUp(ctx context.Context, conn net.Conn, info *handsha
 		return stderrs.New("satls: reconnect on up link")
 	}
 	if !s.replay.Reserve(info.sessionID) {
-		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni)
+		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni, "", nil)
 		return stderrs.New("satls: duplicate session id")
 	}
 	session := newSplitSession(info.sessionID, info.user, conn)
@@ -390,7 +418,7 @@ func (s *Server) handleSplitDown(ctx context.Context, conn net.Conn, info *hands
 	session, ok := s.splitSessions[info.sessionID]
 	s.sessionsMu.Unlock()
 	if !ok {
-		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni)
+		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni, "", nil)
 		return stderrs.New("satls: unknown session")
 	}
 	// reconnect allowed, handled by attachDown
@@ -815,7 +843,7 @@ func (c *splitConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *http.Request, targetHost string, sni string) error {
+func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *http.Request, targetHost string, sni string, negotiatedProto string, prefetched []byte) error {
 	resolveHost := strings.TrimSpace(targetHost)
 	if resolveHost == "" && req != nil {
 		resolveHost = req.Host
@@ -826,71 +854,148 @@ func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *ht
 	if resolveHost == "" {
 		return stderrs.New("satls: fallback host missing")
 	}
-	hostHeader := strings.TrimSpace(sni)
-	if hostHeader == "" && req != nil {
-		hostHeader = strings.TrimSpace(req.Host)
-		if hostHeader == "" && req.URL != nil {
-			hostHeader = strings.TrimSpace(req.URL.Host)
+	hostHeader := resolveHost
+	lookupHost, lookupPort := splitHostPortLoose(resolveHost, "443")
+	if lookupHost == "" {
+		return stderrs.New("satls: fallback host missing")
+	}
+	dialPort := lookupPort
+	sniHost := lookupHost
+	if ip := net.ParseIP(sniHost); ip != nil && hostHeader != "" {
+		if h, _, err := net.SplitHostPort(hostHeader); err == nil && h != "" {
+			sniHost = h
+		} else if h := strings.TrimSpace(hostHeader); h != "" {
+			sniHost = h
 		}
 	}
-	if hostHeader == "" {
-		hostHeader = resolveHost
-	}
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Info,
+		Content:  fmt.Sprintf("satls fallback: resolve start host=%s port=%s sni=%s remote=%v", lookupHost, dialPort, sniHost, clientConn.RemoteAddr()),
+	})
 	// resolve target host to IP and connect directly
-	ipAddrs, err := net.DefaultResolver.LookupIP(ctx, "ip", resolveHost)
+	ipAddrs, err := net.DefaultResolver.LookupIP(ctx, "ip", lookupHost)
 	if err != nil || len(ipAddrs) == 0 {
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Warning,
+			Content:  fmt.Sprintf("satls fallback: resolve failed host=%s err=%v remote=%v", lookupHost, err, clientConn.RemoteAddr()),
+		})
 		return stderrs.New("satls: fallback resolve failed")
 	}
 	ip := ipAddrs[0].String()
-	forwardURL := &url.URL{Scheme: "https", Host: hostHeader, Path: "/"}
-	forwardReq, err := http.NewRequestWithContext(ctx, http.MethodGet, forwardURL.String(), nil)
-	if err != nil {
-		return err
-	}
-	forwardReq.Host = hostHeader
-	// try to mimic browser-ish TLS/headers
-	forwardReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	forwardReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-	forwardReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	forwardReq.Header.Set("Connection", "close")
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Info,
+		Content:  fmt.Sprintf("satls fallback: resolved host=%s ip=%s port=%s remote=%v", lookupHost, ip, dialPort, clientConn.RemoteAddr()),
+	})
 
-	transport := *s.fallbackClient.Transport.(*http.Transport)
-	dialer := net.Dialer{Timeout: 5 * time.Second}
-	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
-	}
-	transport.TLSClientConfig = transport.TLSClientConfig.Clone()
-	transport.TLSClientConfig.MinVersion = tls.VersionTLS13
-	transport.TLSClientConfig.MaxVersion = tls.VersionTLS13
-	transport.TLSClientConfig.ServerName = hostHeader
-	client := &http.Client{Timeout: s.fallbackClient.Timeout, Transport: &transport}
-
-	resp, err := client.Do(forwardReq)
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	rawBackend, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, dialPort))
 	if err != nil {
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Warning,
+			Content:  fmt.Sprintf("satls fallback: dial failed host=%s ip=%s port=%s err=%v remote=%v", lookupHost, ip, dialPort, err, clientConn.RemoteAddr()),
+		})
 		return err
 	}
-	defer resp.Body.Close()
-	bufferedWriter := bufio.NewWriter(clientConn)
-	if _, err := fmt.Fprintf(bufferedWriter, "HTTP/1.1 %s\r\n", resp.Status); err != nil {
+	tlsConf := s.fallbackClient.Transport.(*http.Transport).TLSClientConfig.Clone()
+	tlsConf.ServerName = sniHost
+	// Allow TLS 1.2 and 1.3 for better compatibility with different backends
+	tlsConf.MinVersion = tls.VersionTLS12
+	tlsConf.MaxVersion = tls.VersionTLS13
+	tlsConf.NextProtos = []string{"http/1.1"}
+	tlsConf.InsecureSkipVerify = true
+	backendConn := tls.Client(rawBackend, tlsConf)
+	if err := backendConn.HandshakeContext(ctx); err != nil {
+		backendConn.Close()
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Warning,
+			Content:  fmt.Sprintf("satls fallback: tls handshake failed host=%s ip=%s port=%s err=%v remote=%v", lookupHost, ip, dialPort, err, clientConn.RemoteAddr()),
+		})
 		return err
 	}
-	headers := resp.Header.Clone()
-	headers.Set("Connection", "close")
-	if err := headers.Write(bufferedWriter); err != nil {
-		return err
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Info,
+		Content:  fmt.Sprintf("satls fallback: connected host=%s ip=%s port=%s remote=%v", lookupHost, ip, dialPort, clientConn.RemoteAddr()),
+	})
+
+	if len(prefetched) > 0 {
+		if _, err := backendConn.Write(prefetched); err != nil {
+			backendConn.Close()
+			return err
+		}
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Debug,
+			Content:  fmt.Sprintf("satls fallback: wrote prefetched bytes len=%d remote=%v", len(prefetched), clientConn.RemoteAddr()),
+		})
 	}
-	if _, err := bufferedWriter.WriteString("\r\n"); err != nil {
-		return err
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var upBytes, downBytes int64
+	copyWithCount := func(dst, src net.Conn, label string, after func(), counter *int64) {
+		defer wg.Done()
+		n, copyErr := io.Copy(dst, src)
+		if counter != nil {
+			*counter = n
+		}
+		if copyErr != nil && !errors.Is(copyErr, io.EOF) {
+			log.Record(&log.GeneralMessage{
+				Severity: log.Severity_Info,
+				Content:  fmt.Sprintf("satls fallback: pipe closed (%s): %v remote=%v bytes=%d", label, copyErr, clientConn.RemoteAddr(), n),
+			})
+		} else {
+			log.Record(&log.GeneralMessage{
+				Severity: log.Severity_Debug,
+				Content:  fmt.Sprintf("satls fallback: pipe closed (%s) clean remote=%v bytes=%d", label, clientConn.RemoteAddr(), n),
+			})
+		}
+		if after != nil {
+			after()
+		}
 	}
-	if _, err := io.Copy(bufferedWriter, resp.Body); err != nil {
-		return err
+	go copyWithCount(backendConn, clientConn, "client->target", func() { closeWriteSafe(backendConn) }, &upBytes)
+	go copyWithCount(clientConn, backendConn, "target->client", func() { closeWriteSafe(clientConn) }, &downBytes)
+	wg.Wait()
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Debug,
+		Content:  fmt.Sprintf("satls fallback: pipe done remote=%v up_bytes=%d down_bytes=%d", clientConn.RemoteAddr(), upBytes, downBytes),
+	})
+	backendConn.Close()
+	return nil
+}
+
+func splitHostPortLoose(hostport string, defaultPort string) (string, string) {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" {
+		return "", ""
 	}
-	return bufferedWriter.Flush()
+	if h, p, err := net.SplitHostPort(hostport); err == nil {
+		if p == "" {
+			p = defaultPort
+		}
+		return h, p
+	}
+	// maybe host without port or IPv6 without brackets
+	return hostport, defaultPort
 }
 
 func (s *Server) sleepFallbackDelay() {
 	delay := time.Duration(50+rand.Intn(150)) * time.Millisecond
 	time.Sleep(delay)
+}
+
+func closeWriteSafe(conn net.Conn) {
+	type closeWriter interface {
+		CloseWrite() error
+	}
+	if cw, ok := conn.(closeWriter); ok {
+		_ = cw.CloseWrite()
+		return
+	}
+	if cc, ok := conn.(*cachedConn); ok {
+		if cw, ok := cc.Conn.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 }
 
 // errVersionMismatch signals S-Version mismatch for 426 handling.
