@@ -60,23 +60,6 @@ type Server struct {
 	fallbackClient *http.Client
 }
 
-type captureConn struct {
-	net.Conn
-	buf bytes.Buffer
-}
-
-func (c *captureConn) Read(p []byte) (int, error) {
-	n, err := c.Conn.Read(p)
-	if n > 0 {
-		_, _ = c.buf.Write(p[:n])
-	}
-	return n, err
-}
-
-func (c *captureConn) Captured() []byte {
-	return c.buf.Bytes()
-}
-
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	coreInstance := core.MustFromContext(ctx)
 	pm := coreInstance.GetFeature(policy.ManagerType()).(policy.Manager)
@@ -170,12 +153,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	}
 	fallbackTarget := s.fallbackHost(nil)
 	remoteAddr := conn.RemoteAddr()
-	capConn := &captureConn{Conn: tlsConn}
-	conn = capConn
-	negProto := ""
-	if tc, ok := tlsConn.(*tls.Conn); ok {
-		negProto = tc.ConnectionState().NegotiatedProtocol
-	}
+	conn = tlsConn
 	reader := bufio.NewReader(conn)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
@@ -184,7 +162,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 			Content:  fmt.Sprintf("satls fallback: http read request failed: %v remote=%v target=%s", err, remoteAddr, fallbackTarget),
 		})
 		_ = conn.SetDeadline(time.Time{})
-		s.handleFallback(ctx, newCachedConn(conn, reader), nil, nil, fallbackTarget, sni, negProto, capConn.Captured())
+		s.handleFallback(ctx, newCachedConn(conn, reader), nil, nil, fallbackTarget, sni)
 		return err
 	}
 	fallbackTarget = s.pickFallbackTarget(req, sni)
@@ -197,7 +175,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 			Content:  fmt.Sprintf("satls fallback: read body failed: %v remote=%v target=%s", err, remoteAddr, fallbackTarget),
 		})
 		_ = conn.SetDeadline(time.Time{})
-		s.handleFallback(ctx, newCachedConn(conn, reader), req, nil, fallbackTarget, sni, negProto, capConn.Captured())
+		s.handleFallback(ctx, newCachedConn(conn, reader), req, nil, fallbackTarget, sni)
 		return err
 	}
 	req.Body = io.NopCloser(bytes.NewReader(body))
@@ -213,7 +191,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 				Content:  fmt.Sprintf("satls fallback: validation failed: %v remote=%v target=%s", err, remoteAddr, fallbackTarget),
 			})
 			_ = conn.SetDeadline(time.Time{})
-			s.handleFallback(ctx, newCachedConn(conn, reader), req, body, fallbackTarget, sni, negProto, capConn.Captured())
+			s.handleFallback(ctx, newCachedConn(conn, reader), req, body, fallbackTarget, sni)
 		}
 		return err
 	}
@@ -284,7 +262,7 @@ type handshakeRequest struct {
 	sni       string
 }
 
-func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Request, body []byte, targetHost string, sni string, negotiatedProto string, prefetched []byte) {
+func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Request, body []byte, targetHost string, sni string) {
 	_ = conn.SetDeadline(time.Time{})
 	if req != nil {
 		if req.Body != nil {
@@ -294,7 +272,7 @@ func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Re
 			req.Body = io.NopCloser(bytes.NewReader(body))
 		}
 	}
-	if err := s.proxyFallback(ctx, conn, req, targetHost, sni, negotiatedProto, prefetched); err != nil {
+	if err := s.proxyFallback(ctx, conn, req, targetHost, sni); err != nil {
 		s.sleepFallbackDelay()
 		s.writeErrorResponse(conn, http.StatusBadRequest, "")
 	}
@@ -366,7 +344,7 @@ func (s *Server) findUser(path string) *protocol.MemoryUser {
 
 func (s *Server) handleFull(ctx context.Context, conn net.Conn, info *handshakeRequest, dispatcher routing.Dispatcher) error {
 	if !s.replay.Reserve(info.sessionID) {
-		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni, "", nil)
+		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni)
 		return stderrs.New("satls: duplicate session id")
 	}
 	// FULL 链路返回 101
@@ -381,7 +359,7 @@ func (s *Server) handleSplitUp(ctx context.Context, conn net.Conn, info *handsha
 		return stderrs.New("satls: reconnect on up link")
 	}
 	if !s.replay.Reserve(info.sessionID) {
-		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni, "", nil)
+		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni)
 		return stderrs.New("satls: duplicate session id")
 	}
 	session := newSplitSession(info.sessionID, info.user, conn)
@@ -418,7 +396,7 @@ func (s *Server) handleSplitDown(ctx context.Context, conn net.Conn, info *hands
 	session, ok := s.splitSessions[info.sessionID]
 	s.sessionsMu.Unlock()
 	if !ok {
-		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni, "", nil)
+		s.handleFallback(ctx, conn, nil, nil, s.fallbackHost(info), info.sni)
 		return stderrs.New("satls: unknown session")
 	}
 	// reconnect allowed, handled by attachDown
@@ -843,7 +821,7 @@ func (c *splitConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *http.Request, targetHost string, sni string, negotiatedProto string, prefetched []byte) error {
+func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *http.Request, targetHost string, sni string) error {
 	resolveHost := strings.TrimSpace(targetHost)
 	if resolveHost == "" && req != nil {
 		resolveHost = req.Host
@@ -916,17 +894,6 @@ func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *ht
 		Severity: log.Severity_Info,
 		Content:  fmt.Sprintf("satls fallback: connected host=%s ip=%s port=%s remote=%v", lookupHost, ip, dialPort, clientConn.RemoteAddr()),
 	})
-
-	if len(prefetched) > 0 {
-		if _, err := backendConn.Write(prefetched); err != nil {
-			backendConn.Close()
-			return err
-		}
-		log.Record(&log.GeneralMessage{
-			Severity: log.Severity_Debug,
-			Content:  fmt.Sprintf("satls fallback: wrote prefetched bytes len=%d remote=%v", len(prefetched), clientConn.RemoteAddr()),
-		})
-	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
