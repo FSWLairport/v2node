@@ -154,6 +154,10 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	fallbackTarget := s.fallbackHost(nil)
 	remoteAddr := conn.RemoteAddr()
 	conn = tlsConn
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Debug,
+		Content:  fmt.Sprintf("satls handshake: tls accepted sni=%s remote=%v fallback_target=%s", sni, remoteAddr, fallbackTarget),
+	})
 	reader := bufio.NewReader(conn)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
@@ -201,6 +205,10 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 		return errVersionMismatch
 	}
 	_ = conn.SetReadDeadline(time.Time{})
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Debug,
+		Content:  fmt.Sprintf("satls handshake: validated path=%s session=%s mode=%s reconnect=%t version=%s sni=%s remote=%v", info.path, info.sessionID, info.mode.String(), info.reconnect, info.version, info.sni, remoteAddr),
+	})
 	cached := newCachedConn(conn, reader)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		inbound.Name = protocolName
@@ -272,6 +280,10 @@ func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Re
 			req.Body = io.NopCloser(bytes.NewReader(body))
 		}
 	}
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Debug,
+		Content:  fmt.Sprintf("satls fallback: begin target=%s sni=%s remote=%v", targetHost, sni, conn.RemoteAddr()),
+	})
 	if err := s.proxyFallback(ctx, conn, req, targetHost, sni); err != nil {
 		s.sleepFallbackDelay()
 		s.writeErrorResponse(conn, http.StatusBadRequest, "")
@@ -446,6 +458,14 @@ func (s *Server) runMux(ctx context.Context, conn net.Conn, user *protocol.Memor
 	if err != nil {
 		return err
 	}
+	userEmail := ""
+	if user != nil {
+		userEmail = user.Email
+	}
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Debug,
+		Content:  fmt.Sprintf("satls mux: start user=%s remote=%v", userEmail, conn.RemoteAddr()),
+	})
 	defer smuxSession.Close()
 	for {
 		stream, err := smuxSession.AcceptStream()
@@ -469,6 +489,15 @@ func (s *Server) handleStream(ctx context.Context, user *protocol.MemoryUser, st
 		_ = writer.Flush()
 		return
 	}
+	destStr := dest.String()
+	userEmail := ""
+	if user != nil {
+		userEmail = user.Email
+	}
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Debug,
+		Content:  fmt.Sprintf("satls mux: stream dest=%s user=%s remote=%v", destStr, userEmail, stream.RemoteAddr()),
+	})
 	sessPolicy := s.policyManager.ForLevel(user.Level)
 	subCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -479,30 +508,56 @@ func (s *Server) handleStream(ctx context.Context, user *protocol.MemoryUser, st
 		Email:  user.Email,
 		Status: log.AccessAccepted,
 	})
+	remoteAddr := stream.RemoteAddr()
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Info,
+			Content:  fmt.Sprintf("satls mux: dispatch failed dest=%s user=%s err=%v remote=%v", destStr, userEmail, err, remoteAddr),
+		})
 		writer.WriteByte(0xEE)
 		_ = writer.Flush()
 		return
 	}
 	writer.WriteByte(0x00)
 	if err := writer.Flush(); err != nil {
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Info,
+			Content:  fmt.Sprintf("satls mux: write ack failed dest=%s user=%s err=%v remote=%v", destStr, userEmail, err, remoteAddr),
+		})
 		common.Interrupt(link.Reader)
 		common.Interrupt(link.Writer)
 		return
 	}
+	upCounter := &buf.SizeCounter{}
+	downCounter := &buf.SizeCounter{}
 	requestDone := func() error {
 		defer timer.SetTimeout(sessPolicy.Timeouts.DownlinkOnly)
-		return buf.Copy(reader, link.Writer, buf.UpdateActivity(timer))
+		return buf.Copy(reader, link.Writer, buf.UpdateActivity(timer), buf.CountSize(upCounter))
 	}
 	responseDone := func() error {
 		defer timer.SetTimeout(sessPolicy.Timeouts.UplinkOnly)
-		return buf.Copy(link.Reader, writer, buf.UpdateActivity(timer))
+		return buf.Copy(link.Reader, writer, buf.UpdateActivity(timer), buf.CountSize(downCounter))
 	}
 	if err := task.Run(ctx, task.OnSuccess(requestDone, task.Close(link.Writer)), responseDone); err != nil {
+		dir := "unknown"
+		if buf.IsReadError(err) {
+			dir = "read"
+		} else if buf.IsWriteError(err) {
+			dir = "write"
+		}
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Info,
+			Content:  fmt.Sprintf("satls mux: stream closed with error dest=%s user=%s dir=%s err=%v up_bytes=%d down_bytes=%d remote=%v", destStr, userEmail, dir, err, upCounter.Size, downCounter.Size, remoteAddr),
+		})
 		common.Interrupt(link.Reader)
 		common.Interrupt(link.Writer)
+		return
 	}
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Debug,
+		Content:  fmt.Sprintf("satls mux: stream closed clean dest=%s user=%s up_bytes=%d down_bytes=%d remote=%v", destStr, userEmail, upCounter.Size, downCounter.Size, remoteAddr),
+	})
 }
 
 func satlsSmuxConfig() *smux.Config {
@@ -894,6 +949,13 @@ func (s *Server) proxyFallback(ctx context.Context, clientConn net.Conn, req *ht
 		Severity: log.Severity_Info,
 		Content:  fmt.Sprintf("satls fallback: connected host=%s ip=%s port=%s remote=%v", lookupHost, ip, dialPort, clientConn.RemoteAddr()),
 	})
+
+	if req != nil {
+		if err := req.Write(backendConn); err != nil {
+			backendConn.Close()
+			return err
+		}
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
