@@ -529,6 +529,8 @@ func (s *Server) handleStream(ctx context.Context, user *protocol.MemoryUser, st
 		common.Interrupt(link.Writer)
 		return
 	}
+	// Ensure the first downstream chunk flushes immediately and disables buffering.
+	writer.SetFlushNext()
 	upCounter := &buf.SizeCounter{}
 	downCounter := &buf.SizeCounter{}
 	requestDone := func() error {
