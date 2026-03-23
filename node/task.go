@@ -95,6 +95,27 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		}).Error("Get user list failed")
 		return nil
 	}
+
+	// DynamicGuard 模式: 更新 userKeyMap，清理已删除用户
+	if c.dgServer != nil {
+		if len(newU) > 0 {
+			// 找出被删除的用户，移除其设备和 WG peer
+			newMap := make(map[int]struct{}, len(newU))
+			for _, u := range newU {
+				newMap[u.Id] = struct{}{}
+			}
+			for _, u := range c.userList {
+				if _, exists := newMap[u.Id]; !exists {
+					c.dgServer.RemoveUser(u.Id)
+				}
+			}
+			c.userList = newU
+			c.updateDGUsers(c.dgServer)
+			log.WithField("tag", c.tag).Infof("Updated %d DG users", len(newU))
+		}
+		return nil
+	}
+
 	// get user alive
 	newA, err := c.apiClient.GetUserAlive()
 	if err != nil {

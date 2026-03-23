@@ -61,6 +61,19 @@ type CommonNode struct {
 	ObfsPassword            string         `json:"obfs-password"`
 	Ignore_Client_Bandwidth bool           `json:"ignore_client_bandwidth"`
 	SatlsSettings           *SatlsSettings `json:"satls_settings"`
+	//dynamicguard
+	DGSettings *DGNodeSettings `json:"dg_settings,omitempty"`
+}
+
+type DGNodeSettings struct {
+	ServerWGKeyPath   string            `json:"server_wg_key_path"`
+	ServerWGPublicKey string            `json:"server_wg_public_key"`
+	LeaseTTL          uint32            `json:"lease_ttl"`
+	IPPools           map[string]string `json:"ip_pools"`
+	AllowedIPs        []string          `json:"allowed_ips"`
+	CookieEnabled     bool              `json:"cookie_enabled"`
+	PowDifficulty     uint8             `json:"pow_difficulty"`
+	MTU               int               `json:"mtu"`
 }
 
 type SatlsTLS struct {
@@ -177,6 +190,9 @@ func (c *Client) GetNodeInfo() (node *NodeInfo, err error) {
 		node.Type = cm.Protocol
 		node.Security = cm.Tls
 	case "shadowsocks":
+		node.Type = cm.Protocol
+		node.Security = 0
+	case "dynamicguard":
 		node.Type = cm.Protocol
 		node.Security = 0
 	default:

@@ -6,6 +6,11 @@ import (
 )
 
 func (c *Controller) reportUserTrafficTask() (err error) {
+	// DynamicGuard 流量上报
+	if c.dgServer != nil {
+		return c.reportDGTraffic()
+	}
+
 	var reportmin = 0
 	var devicemin = 0
 	if c.info.Common.BaseConfig != nil {
@@ -59,6 +64,33 @@ func (c *Controller) reportUserTrafficTask() (err error) {
 	}
 
 	userTraffic = nil
+	return nil
+}
+
+func (c *Controller) reportDGTraffic() error {
+	dgTraffic := c.dgServer.GetUserTraffic()
+	if len(dgTraffic) == 0 {
+		return nil
+	}
+
+	userTraffic := make([]panel.UserTraffic, 0, len(dgTraffic))
+	for _, t := range dgTraffic {
+		userTraffic = append(userTraffic, panel.UserTraffic{
+			UID:      t.UserID,
+			Upload:   t.Upload,
+			Download: t.Download,
+		})
+	}
+
+	err := c.apiClient.ReportUserTraffic(userTraffic)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"tag": c.tag,
+			"err": err,
+		}).Info("Report DG user traffic failed")
+	} else {
+		log.WithField("tag", c.tag).Infof("Report %d DG users traffic", len(userTraffic))
+	}
 	return nil
 }
 
