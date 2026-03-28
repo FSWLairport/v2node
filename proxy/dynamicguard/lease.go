@@ -58,6 +58,11 @@ func (lm *LeaseManager) doCleanup() {
 	}
 
 	for _, ed := range expired {
+		log.WithFields(log.Fields{
+			"user_id":  ed.Entry.UserID,
+			"group_id": ed.Entry.GroupID,
+			"ip":       ed.OldIP.String(),
+		}).Debug("[DynamicGuard] cleaning expired device")
 		// 从 WireGuard 移除 peer
 		if err := lm.wgDevice.RemovePeer(ed.Entry.WGStaticPub); err != nil {
 			log.Warnf("[DynamicGuard] remove expired peer failed: %v", err)

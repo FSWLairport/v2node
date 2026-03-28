@@ -111,6 +111,17 @@ func (c *Controller) startDynamicGuard(node *panel.NodeInfo) error {
 		listenAddr = fmt.Sprintf(":%d", node.Common.ServerPort)
 	}
 
+	log.WithFields(log.Fields{
+		"tag":            c.tag,
+		"listen":         listenAddr,
+		"lease_ttl":      dgSettings.LeaseTTL,
+		"ip_pool_count":  len(dgSettings.IPPools),
+		"route_count":    len(dgSettings.Routes),
+		"cookie_enabled": dgSettings.CookieEnabled,
+		"pow_difficulty": dgSettings.PowDifficulty,
+		"mtu":            dgSettings.MTU,
+	}).Info("Starting DynamicGuard node")
+
 	dgServer, err := dynamicguard.NewDGServer(&dynamicguard.DGServerConfig{
 		ListenAddr: listenAddr,
 		DGSettings: &dynamicguard.DGSettings{
@@ -136,6 +147,10 @@ func (c *Controller) startDynamicGuard(node *panel.NodeInfo) error {
 	}
 
 	c.dgServer = dgServer
+	log.WithFields(log.Fields{
+		"tag":        c.tag,
+		"user_count": len(c.userList),
+	}).Info("DynamicGuard node started")
 	c.startTasks(node)
 	return nil
 }

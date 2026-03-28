@@ -1,6 +1,7 @@
 package dynamicguard
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
 	"sync/atomic"
@@ -67,13 +68,21 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 	// Step 1: 解析报文（校验 magic/version/size）
 	msg, err := ParseClientInit(data)
 	if err != nil {
-		log.Debugf("[DynamicGuard] parse ClientInit failed: %v", err)
+		log.WithFields(log.Fields{
+			"src":          srcAddr.String(),
+			"packet_bytes": len(data),
+			"err":          err,
+		}).Debug("[DynamicGuard] parse ClientInit failed")
 		return // 静默丢弃
 	}
 
 	// Step 2: 查 userKeyMap
 	user := h.userKeyMap.Get(msg.UserKey)
 	if user == nil {
+		log.WithFields(log.Fields{
+			"src":    srcAddr.String(),
+			"device": fmt.Sprintf("%x", msg.DeviceID[:4]),
+		}).Debug("[DynamicGuard] unknown user key")
 		return // 静默丢弃
 	}
 
@@ -83,17 +92,32 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 			var cookie [32]byte
 			copy(cookie[:], msg.Cookie)
 			if !h.cookieMgr.VerifyCookie(cookie, srcAddr.IP, uint16(srcAddr.Port)) {
+				log.WithFields(log.Fields{
+					"src":     srcAddr.String(),
+					"user_id": user.UserID,
+					"device":  fmt.Sprintf("%x", msg.DeviceID[:4]),
+				}).Debug("[DynamicGuard] cookie verification failed")
 				return // 静默丢弃
 			}
 
 			// Step 4: PoW 校验
 			if h.cookieMgr.GetPowDifficulty() > 0 {
 				if len(msg.PowNonce) != 8 {
+					log.WithFields(log.Fields{
+						"src":     srcAddr.String(),
+						"user_id": user.UserID,
+						"device":  fmt.Sprintf("%x", msg.DeviceID[:4]),
+					}).Debug("[DynamicGuard] invalid PoW nonce length")
 					return // 静默丢弃
 				}
 				var powNonce [8]byte
 				copy(powNonce[:], msg.PowNonce)
 				if !VerifyPoW(cookie, powNonce, h.cookieMgr.GetPowDifficulty()) {
+					log.WithFields(log.Fields{
+						"src":     srcAddr.String(),
+						"user_id": user.UserID,
+						"device":  fmt.Sprintf("%x", msg.DeviceID[:4]),
+					}).Debug("[DynamicGuard] PoW verification failed")
 					return // 静默丢弃
 				}
 			}
@@ -103,6 +127,12 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 				cookie := h.cookieMgr.GenerateCookie(srcAddr.IP, uint16(srcAddr.Port))
 				reply := BuildCookieReply(cookie, h.cookieMgr.GetPowDifficulty())
 				udpConn.WriteToUDP(reply, srcAddr)
+				log.WithFields(log.Fields{
+					"src":              srcAddr.String(),
+					"user_id":          user.UserID,
+					"device":           fmt.Sprintf("%x", msg.DeviceID[:4]),
+					"pending_requests": h.pendingCount.Load(),
+				}).Debug("[DynamicGuard] sent cookie challenge")
 				return
 			}
 		}
@@ -110,6 +140,11 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 
 	// Step 6: MAC 校验
 	if !VerifyMAC(msg.UserKey, msg.ClientNonce, msg.DataBeforeMAC, msg.MAC) {
+		log.WithFields(log.Fields{
+			"src":     srcAddr.String(),
+			"user_id": user.UserID,
+			"device":  fmt.Sprintf("%x", msg.DeviceID[:4]),
+		}).Debug("[DynamicGuard] MAC verification failed")
 		return // 静默丢弃
 	}
 
@@ -117,6 +152,11 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 	idemKey := ComputeIdempotencyKey(msg.UserKey, msg.DeviceID, msg.EphPub, msg.WGStaticPub, msg.ClientNonce)
 	if cached, ok := h.idemCache.Get(idemKey); ok {
 		udpConn.WriteToUDP(cached, srcAddr)
+		log.WithFields(log.Fields{
+			"src":     srcAddr.String(),
+			"user_id": user.UserID,
+			"device":  fmt.Sprintf("%x", msg.DeviceID[:4]),
+		}).Debug("[DynamicGuard] idempotent reply reused")
 		return
 	}
 
@@ -134,9 +174,19 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 	if entry != nil {
 		// 已有记录
 		if entry.Status == DeviceStatusRevoked {
+			log.WithFields(log.Fields{
+				"src":     srcAddr.String(),
+				"user_id": user.UserID,
+				"device":  fmt.Sprintf("%x", msg.DeviceID[:4]),
+			}).Debug("[DynamicGuard] revoked device rejected")
 			return // 静默丢弃
 		}
 		if entry.WGStaticPub != msg.WGStaticPub {
+			log.WithFields(log.Fields{
+				"src":     srcAddr.String(),
+				"user_id": user.UserID,
+				"device":  fmt.Sprintf("%x", msg.DeviceID[:4]),
+			}).Warn("[DynamicGuard] device public key mismatch")
 			return // wg_static_pub 不一致，静默丢弃
 		}
 
@@ -157,15 +207,35 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 			assignedIP = newIP
 			entry.AssignedIP = newIP
 			h.deviceTable.UpdateIP(entry)
+			log.WithFields(log.Fields{
+				"src":      srcAddr.String(),
+				"user_id":  user.UserID,
+				"device":   fmt.Sprintf("%x", msg.DeviceID[:4]),
+				"group_id": user.GroupID,
+				"ip":       newIP.String(),
+			}).Info("[DynamicGuard] disconnected device reallocated IP")
 		} else {
 			// active 设备重连，复用原 IP
 			assignedIP = entry.AssignedIP
+			log.WithFields(log.Fields{
+				"src":      srcAddr.String(),
+				"user_id":  user.UserID,
+				"device":   fmt.Sprintf("%x", msg.DeviceID[:4]),
+				"group_id": user.GroupID,
+				"ip":       assignedIP.String(),
+			}).Debug("[DynamicGuard] active device reused IP")
 		}
 		entry.Status = DeviceStatusActive
 		entry.LastSeen = time.Now()
 	} else {
 		// 新设备：检查设备数限制
 		if user.DeviceLimit > 0 && h.deviceTable.CountByUser(user.UserID) >= user.DeviceLimit {
+			log.WithFields(log.Fields{
+				"src":          srcAddr.String(),
+				"user_id":      user.UserID,
+				"device":       fmt.Sprintf("%x", msg.DeviceID[:4]),
+				"device_limit": user.DeviceLimit,
+			}).Info("[DynamicGuard] device limit reached")
 			return // 静默丢弃
 		}
 
@@ -197,6 +267,13 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 			log.Warnf("[DynamicGuard] device register failed: %v", err)
 			return
 		}
+		log.WithFields(log.Fields{
+			"src":      srcAddr.String(),
+			"user_id":  user.UserID,
+			"device":   fmt.Sprintf("%x", msg.DeviceID[:4]),
+			"group_id": user.GroupID,
+			"ip":       assignedIP.String(),
+		}).Info("[DynamicGuard] registered new device")
 	}
 
 	// Step 11: WireGuard AddPeer
@@ -256,6 +333,10 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 	// Step 14: 写入幂等缓存
 	h.idemCache.Set(idemKey, reply)
 
-	log.Debugf("[DynamicGuard] user=%d device=%x assigned_ip=%s",
-		user.UserID, msg.DeviceID[:4], assignedIP)
+	log.WithFields(log.Fields{
+		"src":     srcAddr.String(),
+		"user_id": user.UserID,
+		"device":  fmt.Sprintf("%x", msg.DeviceID[:4]),
+		"ip":      assignedIP.String(),
+	}).Debug("[DynamicGuard] handshake completed")
 }

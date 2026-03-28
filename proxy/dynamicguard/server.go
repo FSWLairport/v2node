@@ -108,6 +108,10 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		tunnelAddrs = append(tunnelAddrs, gwAddr)
 		ipPrefixes = append(ipPrefixes, pool.network)
 		pool.Reserve(gwAddr)
+		log.WithFields(log.Fields{
+			"gateway": gwAddr.String(),
+			"network": pool.network.String(),
+		}).Debug("[DynamicGuard] reserved pool gateway")
 	}
 	if len(tunnelAddrs) == 0 {
 		udpConn.Close()
@@ -175,14 +179,25 @@ func (s *DGServer) Start() error {
 	// 启动 UDP 读取循环
 	go s.readLoop()
 
-	log.Infof("[DynamicGuard] server started on %s", s.udpConn.LocalAddr())
+	log.WithFields(log.Fields{
+		"listen":         s.udpConn.LocalAddr().String(),
+		"lease_ttl":      s.leaseTTL,
+		"user_count":     len(s.userKeyMap.byID),
+		"ip_pool_count":  len(s.ipPools),
+		"cookie_enabled": s.cookieMgr.IsEnabled(),
+		"pow_difficulty": s.cookieMgr.GetPowDifficulty(),
+	}).Info("[DynamicGuard] server started")
 	return nil
 }
 
 // UpdateUsers 更新用户列表
 func (s *DGServer) UpdateUsers(users []*UserEntry) {
+	oldCount := len(s.userKeyMap.byID)
 	s.userKeyMap.Update(users)
-	log.Debugf("[DynamicGuard] updated %d users", len(users))
+	log.WithFields(log.Fields{
+		"old_users": oldCount,
+		"new_users": len(users),
+	}).Debug("[DynamicGuard] updated users")
 }
 
 // GetUserTraffic 通过 WG IPC 采集 peer 流量并按用户聚合
@@ -194,6 +209,12 @@ func (s *DGServer) GetUserTraffic() []UserTraffic {
 // RemoveUser 移除已删除用户的所有设备（WG peer、IP 池）
 func (s *DGServer) RemoveUser(userID int) {
 	devices := s.deviceTable.GetDevicesByUser(userID)
+	if len(devices) > 0 {
+		log.WithFields(log.Fields{
+			"user_id":      userID,
+			"device_count": len(devices),
+		}).Info("[DynamicGuard] removing deleted user devices")
+	}
 	for _, d := range devices {
 		if err := s.wgDevice.RemovePeer(d.WGStaticPub); err != nil {
 			log.Warnf("[DynamicGuard] remove peer for deleted user %d: %v", userID, err)
@@ -212,12 +233,16 @@ func (s *DGServer) RemoveUser(userID int) {
 
 // Close 关闭 DG 服务端
 func (s *DGServer) Close() {
+	listenAddr := ""
+	if s.udpConn != nil && s.udpConn.LocalAddr() != nil {
+		listenAddr = s.udpConn.LocalAddr().String()
+	}
 	close(s.stopCh)
 	s.leaseMgr.Close()
 	s.idemCache.Close()
 	s.wgDevice.Close()
 	s.udpConn.Close()
-	log.Info("[DynamicGuard] server closed")
+	log.WithField("listen", listenAddr).Info("[DynamicGuard] server closed")
 }
 
 func (s *DGServer) readLoop() {

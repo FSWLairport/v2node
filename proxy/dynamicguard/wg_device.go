@@ -160,6 +160,10 @@ func NewWGDevice(cfg *WGDeviceConfig) (*WGDevice, error) {
 		tunDev.Close()
 		return nil, fmt.Errorf("get TUN name: %w", err)
 	}
+	log.WithFields(log.Fields{
+		"tun": tunName,
+		"mtu": cfg.MTU,
+	}).Info("[DynamicGuard] created TUN device")
 
 	// 创建自定义 bind
 	bind := NewDGBind(cfg.UDPConn)
@@ -210,6 +214,7 @@ func configureNetwork(tunName string, addrs []netip.Addr, prefixes []netip.Prefi
 	if out, err := exec.Command("ip", "link", "set", tunName, "up").CombinedOutput(); err != nil {
 		return fmt.Errorf("ip link set up: %s: %w", strings.TrimSpace(string(out)), err)
 	}
+	log.WithField("tun", tunName).Info("[DynamicGuard] TUN link is up")
 
 	// 添加 IP 地址（每个 IP 池的网关地址，同时自动创建连接路由）
 	for i, addr := range addrs {
@@ -225,7 +230,18 @@ func configureNetwork(tunName string, addrs []netip.Addr, prefixes []netip.Prefi
 	}
 
 	// 启用 IP 转发
-	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
+	if out, err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").CombinedOutput(); err != nil {
+		log.WithFields(log.Fields{
+			"tun": tunName,
+			"err": err,
+			"out": strings.TrimSpace(string(out)),
+		}).Warn("[DynamicGuard] failed to enable ipv4 forwarding")
+	} else {
+		log.WithFields(log.Fields{
+			"tun": tunName,
+			"out": strings.TrimSpace(string(out)),
+		}).Debug("[DynamicGuard] ipv4 forwarding enabled")
+	}
 
 	return nil
 }
@@ -328,6 +344,7 @@ func (w *WGDevice) CollectTrafficDelta() map[[32]byte][2]int64 {
 
 // Close 关闭 WG 设备（TUN 设备随 fd 关闭自动移除，路由随之清除）
 func (w *WGDevice) Close() {
+	log.WithField("tun", w.tunName).Info("[DynamicGuard] closing WireGuard device")
 	w.device.Close()
 }
 

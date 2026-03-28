@@ -101,17 +101,23 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		if len(newU) > 0 {
 			// 找出被删除的用户，移除其设备和 WG peer
 			newMap := make(map[int]struct{}, len(newU))
+			removedCount := 0
 			for _, u := range newU {
 				newMap[u.Id] = struct{}{}
 			}
 			for _, u := range c.userList {
 				if _, exists := newMap[u.Id]; !exists {
 					c.dgServer.RemoveUser(u.Id)
+					removedCount++
 				}
 			}
 			c.userList = newU
 			c.updateDGUsers(c.dgServer)
-			log.WithField("tag", c.tag).Infof("Updated %d DG users", len(newU))
+			log.WithFields(log.Fields{
+				"tag":           c.tag,
+				"current_users": len(newU),
+				"removed_users": removedCount,
+			}).Info("DynamicGuard users refreshed")
 		}
 		return nil
 	}
