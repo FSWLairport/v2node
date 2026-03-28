@@ -152,8 +152,8 @@ Client                                        Server
   ?    32       mac
 ```
 
-无 cookie 时总大小：**171 字节**。
-有 cookie + PoW 时总大小：**211 字节**。
+无 cookie 时总大小：**167 字节**。
+有 cookie + PoW 时总大小：**207 字节**。
 
 ### 6.2 MAC 计算
 
@@ -608,8 +608,8 @@ FAILED
 
 | 报文 | 大小 | 加密 |
 |------|------|------|
-| ClientInit（无 cookie） | 171 字节 | 明文 + MAC |
-| ClientInit（有 cookie + PoW） | 211 字节 | 明文 + MAC |
+| ClientInit（无 cookie） | 167 字节 | 明文 + MAC |
+| ClientInit（有 cookie + PoW） | 207 字节 | 明文 + MAC |
 | ServerReply（IPv4） | 47 字节 | AEAD |
 | ServerReply（IPv6） | 59 字节 | AEAD |
 | CookieReply | 39 字节 | 明文 |

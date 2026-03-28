@@ -25,8 +25,8 @@ var (
 const (
 	cookieReplyMsgType = byte(0xFE)
 	cookieReplySize    = 39
-	minClientInitSize  = 171 // 无 cookie 时最小大小
-	maxClientInitSize  = 211 // 有 cookie + PoW 时最大大小
+	minClientInitSize  = 167 // 无 cookie / 无 PoW 时最小大小
+	maxClientInitSize  = 207 // 有 cookie + PoW 时最大大小
 )
 
 // ClientInitMsg 表示解析后的 ClientInit 报文
