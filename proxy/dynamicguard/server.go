@@ -10,6 +10,7 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/crypto/curve25519"
 )
 
 // DGSettings 从 v2board 下发的 DG 配置
@@ -75,6 +76,14 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		serverWGPriv = decoded
 	} else {
 		copy(serverWGPriv[:], privKeyBytes)
+	}
+
+	serverWGPub, err := derivePublicKey(serverWGPriv)
+	if err != nil {
+		return nil, fmt.Errorf("derive WG public key: %w", err)
+	}
+	if err := validateServerKeyPair(serverWGPub, settings.ServerWGPublicKey); err != nil {
+		return nil, err
 	}
 
 	// 创建 IP 池
@@ -169,6 +178,32 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		leaseTTL:     settings.LeaseTTL,
 		stopCh:       make(chan struct{}),
 	}, nil
+}
+
+func derivePublicKey(privateKey [32]byte) ([32]byte, error) {
+	var publicKey [32]byte
+	publicKeySlice, err := curve25519.X25519(privateKey[:], curve25519.Basepoint)
+	if err != nil {
+		return publicKey, err
+	}
+	copy(publicKey[:], publicKeySlice)
+	return publicKey, nil
+}
+
+func validateServerKeyPair(serverWGPrivPub [32]byte, configuredPublicKey string) error {
+	derivedPublicKey := encodeBase64Key(serverWGPrivPub)
+	configuredPublicKey = strings.TrimSpace(configuredPublicKey)
+	if configuredPublicKey == "" {
+		return fmt.Errorf("missing server_wg_public_key; expected %s", derivedPublicKey)
+	}
+	if configuredPublicKey != derivedPublicKey {
+		return fmt.Errorf("server_wg_public_key mismatch: configured=%s actual=%s", configuredPublicKey, derivedPublicKey)
+	}
+	return nil
+}
+
+func encodeBase64Key(key [32]byte) string {
+	return base64.StdEncoding.EncodeToString(key[:])
 }
 
 // Start 启动 DG 服务端

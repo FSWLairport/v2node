@@ -251,26 +251,31 @@ func (w *WGDevice) AddPeer(publicKey [32]byte, allowedIP netip.Addr) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	pubKeyHex := hex.EncodeToString(publicKey[:])
-	var cidr string
-	if allowedIP.Is4() {
-		cidr = allowedIP.String() + "/32"
-	} else {
-		cidr = allowedIP.String() + "/128"
-	}
-
-	ipcRequest := fmt.Sprintf(
-		"public_key=%s\nreplace_allowed_ips=true\nallowed_ip=%s\npersistent_keepalive_interval=25\n",
-		pubKeyHex, cidr,
-	)
+	ipcRequest := buildPeerIPCRequest(publicKey, allowedIP)
 
 	if err := w.device.IpcSet(ipcRequest); err != nil {
 		return fmt.Errorf("add peer: %w", err)
 	}
 
 	log.Debugf("[DynamicGuard] added WG peer %s with allowed_ip %s",
-		base64.StdEncoding.EncodeToString(publicKey[:]), cidr)
+		base64.StdEncoding.EncodeToString(publicKey[:]), allowedIPCIDR(allowedIP))
 	return nil
+}
+
+func buildPeerIPCRequest(publicKey [32]byte, allowedIP netip.Addr) string {
+	// DynamicGuard 服务端应等待客户端首个合法 WireGuard 握手来学习 endpoint，
+	// 不要在此阶段强制 keepalive 或猜测 endpoint，否则会在 endpoint 未知时触发无意义的主动握手。
+	return fmt.Sprintf(
+		"public_key=%s\nreplace_allowed_ips=true\nallowed_ip=%s\n",
+		hex.EncodeToString(publicKey[:]), allowedIPCIDR(allowedIP),
+	)
+}
+
+func allowedIPCIDR(allowedIP netip.Addr) string {
+	if allowedIP.Is4() {
+		return allowedIP.String() + "/32"
+	}
+	return allowedIP.String() + "/128"
 }
 
 // RemovePeer 移除 WireGuard peer
