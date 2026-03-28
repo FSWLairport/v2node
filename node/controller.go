@@ -118,7 +118,7 @@ func (c *Controller) startDynamicGuard(node *panel.NodeInfo) error {
 			ServerWGPublicKey: dgSettings.ServerWGPublicKey,
 			LeaseTTL:          dgSettings.LeaseTTL,
 			IPPools:           dgSettings.IPPools,
-			AllowedIPs:        dgSettings.AllowedIPs,
+			Routes:            dgSettings.Routes,
 			CookieEnabled:     dgSettings.CookieEnabled,
 			PowDifficulty:     dgSettings.PowDifficulty,
 			MTU:               dgSettings.MTU,

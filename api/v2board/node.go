@@ -70,7 +70,7 @@ type DGNodeSettings struct {
 	ServerWGPublicKey string            `json:"server_wg_public_key"`
 	LeaseTTL          uint32            `json:"lease_ttl"`
 	IPPools           map[string]string `json:"ip_pools"`
-	AllowedIPs        []string          `json:"allowed_ips"`
+	Routes            []string          `json:"routes"`
 	CookieEnabled     bool              `json:"cookie_enabled"`
 	PowDifficulty     uint8             `json:"pow_difficulty"`
 	MTU               int               `json:"mtu"`

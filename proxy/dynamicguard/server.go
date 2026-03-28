@@ -17,8 +17,8 @@ type DGSettings struct {
 	ServerWGKeyPath   string            `json:"server_wg_key_path"`
 	ServerWGPublicKey string            `json:"server_wg_public_key"`
 	LeaseTTL          uint32            `json:"lease_ttl"`
-	IPPools           map[string]string `json:"ip_pools"`    // group_id(string) -> CIDR
-	AllowedIPs        []string          `json:"allowed_ips"`
+	IPPools           map[string]string `json:"ip_pools"` // group_id(string) -> CIDR
+	Routes            []string          `json:"routes"`
 	CookieEnabled     bool              `json:"cookie_enabled"`
 	PowDifficulty     uint8             `json:"pow_difficulty"`
 	MTU               int               `json:"mtu"`
