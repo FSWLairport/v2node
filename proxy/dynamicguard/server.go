@@ -144,6 +144,8 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		udpConn.Close()
 		return nil, fmt.Errorf("create WG device: %w", err)
 	}
+	// 注入设备表引用，使 WG 流量采集时能更新 last_seen
+	wgDevice.SetDeviceTable(deviceTable)
 	cookieMgr := NewCookieManager(settings.CookieEnabled, settings.PowDifficulty)
 
 	// 创建处理器
@@ -182,16 +184,12 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 
 func derivePublicKey(privateKey [32]byte) ([32]byte, error) {
 	var publicKey [32]byte
-	publicKeySlice, err := curve25519.X25519(privateKey[:], curve25519.Basepoint)
-	if err != nil {
-		return publicKey, err
-	}
-	copy(publicKey[:], publicKeySlice)
+	curve25519.ScalarBaseMult(&publicKey, &privateKey)
 	return publicKey, nil
 }
 
-func validateServerKeyPair(serverWGPrivPub [32]byte, configuredPublicKey string) error {
-	derivedPublicKey := encodeBase64Key(serverWGPrivPub)
+func validateServerKeyPair(derivedPub [32]byte, configuredPublicKey string) error {
+	derivedPublicKey := encodeBase64Key(derivedPub)
 	configuredPublicKey = strings.TrimSpace(configuredPublicKey)
 	if configuredPublicKey == "" {
 		return fmt.Errorf("missing server_wg_public_key; expected %s", derivedPublicKey)

@@ -122,13 +122,30 @@ func (p *IPPool) PrefixBits() int {
 	return p.network.Bits()
 }
 
-// addrAtIndex 返回指定索引处的 IP 地址
+// addrAtIndex 返回指定索引处的 IP 地址（O(1) 算术计算）
 func (p *IPPool) addrAtIndex(idx uint32) netip.Addr {
-	addr := p.base
-	for i := uint32(0); i < idx; i++ {
-		addr = addr.Next()
+	if p.base.Is4() {
+		b := p.base.As4()
+		baseInt := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+		result := baseInt + idx
+		return netip.AddrFrom4([4]byte{
+			byte(result >> 24),
+			byte(result >> 16),
+			byte(result >> 8),
+			byte(result),
+		})
 	}
-	return addr
+	// IPv6: 仅偏移低 4 字节
+	b := p.base.As16()
+	low := uint32(b[12])<<24 | uint32(b[13])<<16 | uint32(b[14])<<8 | uint32(b[15])
+	result := low + idx
+	var out [16]byte
+	copy(out[:12], b[:12])
+	out[12] = byte(result >> 24)
+	out[13] = byte(result >> 16)
+	out[14] = byte(result >> 8)
+	out[15] = byte(result)
+	return netip.AddrFrom16(out)
 }
 
 // indexOf 返回 IP 地址在位图中的索引

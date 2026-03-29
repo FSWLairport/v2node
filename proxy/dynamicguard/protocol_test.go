@@ -3,9 +3,13 @@ package dynamicguard
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"io"
+	"net/netip"
 	"testing"
 
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -130,4 +134,443 @@ func computeTestMAC(t *testing.T, userKey []byte, clientNonce []byte, data []byt
 	h.Write(data)
 	copy(macResult[:], h.Sum(nil))
 	return macResult
+}
+
+// --- VerifyMAC tests ---
+
+func TestVerifyMACAcceptsValidMAC(t *testing.T) {
+	packet := buildClientInitPacket(t, nil, nil)
+	msg, err := ParseClientInit(packet)
+	if err != nil {
+		t.Fatalf("ParseClientInit: %v", err)
+	}
+	if !VerifyMAC(msg.UserKey, msg.ClientNonce, msg.DataBeforeMAC, msg.MAC) {
+		t.Fatal("VerifyMAC should accept valid MAC")
+	}
+}
+
+func TestVerifyMACRejectsTamperedData(t *testing.T) {
+	packet := buildClientInitPacket(t, nil, nil)
+	msg, err := ParseClientInit(packet)
+	if err != nil {
+		t.Fatalf("ParseClientInit: %v", err)
+	}
+
+	// Tamper with DataBeforeMAC
+	tampered := make([]byte, len(msg.DataBeforeMAC))
+	copy(tampered, msg.DataBeforeMAC)
+	tampered[10] ^= 0xFF
+	if VerifyMAC(msg.UserKey, msg.ClientNonce, tampered, msg.MAC) {
+		t.Fatal("VerifyMAC should reject tampered data")
+	}
+}
+
+func TestVerifyMACRejectsWrongUserKey(t *testing.T) {
+	packet := buildClientInitPacket(t, nil, nil)
+	msg, err := ParseClientInit(packet)
+	if err != nil {
+		t.Fatalf("ParseClientInit: %v", err)
+	}
+
+	wrongKey := msg.UserKey
+	wrongKey[0] ^= 0xFF
+	if VerifyMAC(wrongKey, msg.ClientNonce, msg.DataBeforeMAC, msg.MAC) {
+		t.Fatal("VerifyMAC should reject wrong user key")
+	}
+}
+
+// --- ParseClientInit field tests ---
+
+func TestParseClientInitFieldValues(t *testing.T) {
+	packet := buildClientInitPacket(t, nil, nil)
+	msg, err := ParseClientInit(packet)
+	if err != nil {
+		t.Fatalf("ParseClientInit: %v", err)
+	}
+
+	// Verify parsed fields match what we put in
+	userKey := bytesOf(32, 0x01)
+	deviceID := bytesOf(16, 0x21)
+	ephPub := bytesOf(32, 0x31)
+	wgStaticPub := bytesOf(32, 0x51)
+	clientNonce := bytesOf(16, 0x71)
+
+	for i, b := range userKey {
+		if msg.UserKey[i] != b {
+			t.Fatalf("UserKey mismatch at byte %d", i)
+		}
+	}
+	for i, b := range deviceID {
+		if msg.DeviceID[i] != b {
+			t.Fatalf("DeviceID mismatch at byte %d", i)
+		}
+	}
+	for i, b := range ephPub {
+		if msg.EphPub[i] != b {
+			t.Fatalf("EphPub mismatch at byte %d", i)
+		}
+	}
+	for i, b := range wgStaticPub {
+		if msg.WGStaticPub[i] != b {
+			t.Fatalf("WGStaticPub mismatch at byte %d", i)
+		}
+	}
+	for i, b := range clientNonce {
+		if msg.ClientNonce[i] != b {
+			t.Fatalf("ClientNonce mismatch at byte %d", i)
+		}
+	}
+}
+
+func TestParseClientInitRejectsInvalidMagic(t *testing.T) {
+	packet := buildClientInitPacket(t, nil, nil)
+	packet[0] = 0x00 // corrupt magic
+	if _, err := ParseClientInit(packet); err != errInvalidMagic {
+		t.Fatalf("expected errInvalidMagic, got %v", err)
+	}
+}
+
+func TestParseClientInitRejectsInvalidVersion(t *testing.T) {
+	packet := buildClientInitPacket(t, nil, nil)
+	packet[4] = 0x99 // bad version
+	if _, err := ParseClientInit(packet); err != errUnsupportedVersion {
+		t.Fatalf("expected errUnsupportedVersion, got %v", err)
+	}
+}
+
+func TestParseClientInitRejectsInvalidCookieLen(t *testing.T) {
+	packet := buildClientInitPacket(t, nil, nil)
+	// cookie_len field is at offset 133
+	packet[133] = 16 // invalid, only 0 or 32 allowed
+	if _, err := ParseClientInit(packet); err != errInvalidCookieLen {
+		t.Fatalf("expected errInvalidCookieLen, got %v", err)
+	}
+}
+
+// --- IsDynamicGuardPacket / IsWireGuardPacket tests ---
+
+func TestIsDynamicGuardPacket(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"valid DG", []byte{0x44, 0x47, 0x30, 0x31, 0x01}, true},
+		{"too short", []byte{0x44, 0x47, 0x30}, false},
+		{"wrong magic", []byte{0x44, 0x47, 0x30, 0x32, 0x01}, false},
+		{"WG packet", []byte{0x01, 0x00, 0x00, 0x00, 0x00}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsDynamicGuardPacket(tt.data); got != tt.want {
+				t.Fatalf("IsDynamicGuardPacket(%v) = %v, want %v", tt.data, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsWireGuardPacket(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"handshake init", []byte{0x01}, true},
+		{"handshake resp", []byte{0x02}, true},
+		{"cookie reply", []byte{0x03}, true},
+		{"data", []byte{0x04}, true},
+		{"zero", []byte{0x00}, false},
+		{"five", []byte{0x05}, false},
+		{"empty", []byte{}, false},
+		{"DG magic", []byte{0x44}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsWireGuardPacket(tt.data); got != tt.want {
+				t.Fatalf("IsWireGuardPacket = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// --- PoW tests ---
+
+func TestVerifyPoWZeroDifficultyAlwaysTrue(t *testing.T) {
+	if !VerifyPoW([32]byte{}, [8]byte{}, 0) {
+		t.Fatal("PoW with difficulty 0 should always pass")
+	}
+}
+
+func TestVerifyPoWBruteForce(t *testing.T) {
+	cookie := sha256.Sum256([]byte("test-cookie"))
+	difficulty := uint8(8) // easy enough to brute-force quickly
+
+	var found bool
+	for i := 0; i < 1<<16; i++ {
+		var nonce [8]byte
+		binary.LittleEndian.PutUint64(nonce[:], uint64(i))
+		if VerifyPoW(cookie, nonce, difficulty) {
+			found = true
+			// Verify consistency: calling again should also pass
+			if !VerifyPoW(cookie, nonce, difficulty) {
+				t.Fatal("VerifyPoW inconsistent result")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("should find valid nonce within 2^16 attempts for difficulty=8")
+	}
+}
+
+func TestVerifyPoWRejectsInvalidNonce(t *testing.T) {
+	cookie := sha256.Sum256([]byte("reject-test"))
+	// Very high difficulty almost certainly rejects any random nonce
+	if VerifyPoW(cookie, [8]byte{1, 2, 3, 4, 5, 6, 7, 8}, 128) {
+		t.Fatal("difficulty=128 should reject random nonce")
+	}
+}
+
+// --- CookieReply tests ---
+
+func TestBuildCookieReplyFormat(t *testing.T) {
+	var cookie [32]byte
+	for i := range cookie {
+		cookie[i] = byte(i)
+	}
+	reply := BuildCookieReply(cookie, 16)
+
+	if len(reply) != cookieReplySize {
+		t.Fatalf("expected size %d, got %d", cookieReplySize, len(reply))
+	}
+	// Magic
+	if reply[0] != dgMagic[0] || reply[1] != dgMagic[1] || reply[2] != dgMagic[2] || reply[3] != dgMagic[3] {
+		t.Fatal("magic mismatch")
+	}
+	// Version
+	if reply[4] != dgVersion {
+		t.Fatalf("expected version %d, got %d", dgVersion, reply[4])
+	}
+	// Msg type
+	if reply[5] != cookieReplyMsgType {
+		t.Fatalf("expected msg_type %d, got %d", cookieReplyMsgType, reply[5])
+	}
+	// Cookie
+	for i := 0; i < 32; i++ {
+		if reply[6+i] != cookie[i] {
+			t.Fatalf("cookie byte %d mismatch", i)
+		}
+	}
+	// PoW difficulty
+	if reply[38] != 16 {
+		t.Fatalf("expected pow_difficulty 16, got %d", reply[38])
+	}
+}
+
+// --- ServerReply tests ---
+
+func TestBuildServerReplyIPv4Decryptable(t *testing.T) {
+	// Generate key pair for testing
+	var serverPriv [32]byte
+	for i := range serverPriv {
+		serverPriv[i] = byte(i + 1)
+	}
+	var clientEphPriv [32]byte
+	for i := range clientEphPriv {
+		clientEphPriv[i] = byte(i + 100)
+	}
+	var clientEphPub [32]byte
+	curve25519.ScalarBaseMult(&clientEphPub, &clientEphPriv)
+
+	var userKey [32]byte
+	for i := range userKey {
+		userKey[i] = byte(i + 50)
+	}
+	clientNonce, _ := GenerateNonce()
+	serverNonce, _ := GenerateNonce()
+
+	replyKey, err := DeriveReplyKey(serverPriv, clientEphPub, userKey, clientNonce, serverNonce)
+	if err != nil {
+		t.Fatalf("DeriveReplyKey: %v", err)
+	}
+
+	payload := &ServerReplyPayload{
+		AddressFamily: 4,
+		AssignedIP:    netip.MustParseAddr("10.0.0.42"),
+		PrefixLen:     24,
+		LeaseTTL:      3600,
+	}
+
+	reply, err := BuildServerReply(serverNonce, replyKey, payload)
+	if err != nil {
+		t.Fatalf("BuildServerReply: %v", err)
+	}
+
+	// Verify format: magic(4) + version(1) + server_nonce(16) + ciphertext
+	if len(reply) < 21 {
+		t.Fatal("reply too short")
+	}
+	if reply[0] != dgMagic[0] || reply[1] != dgMagic[1] || reply[2] != dgMagic[2] || reply[3] != dgMagic[3] {
+		t.Fatal("magic mismatch")
+	}
+	if reply[4] != dgVersion {
+		t.Fatal("version mismatch")
+	}
+
+	// Client-side derivation should produce the same key
+	var serverPub [32]byte
+	curve25519.ScalarBaseMult(&serverPub, &serverPriv)
+	clientDH, _ := curve25519.X25519(clientEphPriv[:], serverPub[:])
+
+	ikm := make([]byte, 64)
+	copy(ikm[:32], clientDH)
+	copy(ikm[32:], userKey[:])
+	salt := make([]byte, 32)
+	copy(salt[:16], clientNonce[:])
+	copy(salt[16:], serverNonce[:])
+	reader := hkdf.New(sha256.New, ikm, salt, replyInfo)
+	clientReplyKey := make([]byte, 32)
+	io.ReadFull(reader, clientReplyKey)
+
+	// Decrypt
+	aead, _ := chacha20poly1305.New(clientReplyKey)
+	nonce := make([]byte, 12)
+	header := reply[:21]
+	ciphertext := reply[21:]
+	plaintext, err := aead.Open(nil, nonce, ciphertext, header)
+	if err != nil {
+		t.Fatalf("client failed to decrypt ServerReply: %v", err)
+	}
+
+	// Parse payload
+	if plaintext[0] != 4 {
+		t.Fatalf("expected address_family=4, got %d", plaintext[0])
+	}
+	ip := netip.AddrFrom4([4]byte{plaintext[1], plaintext[2], plaintext[3], plaintext[4]})
+	if ip != netip.MustParseAddr("10.0.0.42") {
+		t.Fatalf("expected 10.0.0.42, got %s", ip)
+	}
+	if plaintext[5] != 24 {
+		t.Fatalf("expected prefix_len=24, got %d", plaintext[5])
+	}
+	ttl := binary.LittleEndian.Uint32(plaintext[6:10])
+	if ttl != 3600 {
+		t.Fatalf("expected lease_ttl=3600, got %d", ttl)
+	}
+}
+
+func TestBuildServerReplyIPv6(t *testing.T) {
+	var serverPriv [32]byte
+	for i := range serverPriv {
+		serverPriv[i] = byte(i + 1)
+	}
+	var clientEphPriv [32]byte
+	for i := range clientEphPriv {
+		clientEphPriv[i] = byte(i + 100)
+	}
+	var clientEphPub [32]byte
+	curve25519.ScalarBaseMult(&clientEphPub, &clientEphPriv)
+
+	var userKey [32]byte
+	clientNonce, _ := GenerateNonce()
+	serverNonce, _ := GenerateNonce()
+
+	replyKey, err := DeriveReplyKey(serverPriv, clientEphPub, userKey, clientNonce, serverNonce)
+	if err != nil {
+		t.Fatalf("DeriveReplyKey: %v", err)
+	}
+
+	payload := &ServerReplyPayload{
+		AddressFamily: 6,
+		AssignedIP:    netip.MustParseAddr("fd00::42"),
+		PrefixLen:     112,
+		LeaseTTL:      7200,
+	}
+
+	reply, err := BuildServerReply(serverNonce, replyKey, payload)
+	if err != nil {
+		t.Fatalf("BuildServerReply: %v", err)
+	}
+
+	// IPv6 reply = 21 + 22(payload) + 16(tag) = 59
+	if len(reply) != 59 {
+		t.Fatalf("expected IPv6 reply size 59, got %d", len(reply))
+	}
+}
+
+// --- ComputeIdempotencyKey tests ---
+
+func TestIdempotencyKeyDeterministic(t *testing.T) {
+	k1 := ComputeIdempotencyKey([32]byte{1}, [16]byte{2}, [32]byte{3}, [32]byte{4}, [16]byte{5})
+	k2 := ComputeIdempotencyKey([32]byte{1}, [16]byte{2}, [32]byte{3}, [32]byte{4}, [16]byte{5})
+	if k1 != k2 {
+		t.Fatal("same inputs should yield same idempotency key")
+	}
+}
+
+func TestIdempotencyKeyUnique(t *testing.T) {
+	k1 := ComputeIdempotencyKey([32]byte{1}, [16]byte{2}, [32]byte{3}, [32]byte{4}, [16]byte{5})
+	k2 := ComputeIdempotencyKey([32]byte{1}, [16]byte{2}, [32]byte{3}, [32]byte{4}, [16]byte{6})
+	if k1 == k2 {
+		t.Fatal("different inputs should yield different keys")
+	}
+}
+
+// --- UserKeyFromUUID test ---
+
+func TestUserKeyFromUUIDDeterministic(t *testing.T) {
+	k1 := UserKeyFromUUID("550e8400-e29b-41d4-a716-446655440000")
+	k2 := UserKeyFromUUID("550e8400-e29b-41d4-a716-446655440000")
+	if k1 != k2 {
+		t.Fatal("same UUID should yield same key")
+	}
+
+	k3 := UserKeyFromUUID("different-uuid")
+	if k1 == k3 {
+		t.Fatal("different UUIDs should yield different keys")
+	}
+}
+
+// --- GenerateNonce test ---
+
+func TestGenerateNonceUnique(t *testing.T) {
+	n1, err := GenerateNonce()
+	if err != nil {
+		t.Fatalf("GenerateNonce: %v", err)
+	}
+	n2, err := GenerateNonce()
+	if err != nil {
+		t.Fatalf("GenerateNonce: %v", err)
+	}
+	if n1 == n2 {
+		t.Fatal("two nonces should not be equal")
+	}
+}
+
+// --- checkLeadingZeros tests ---
+
+func TestCheckLeadingZeros(t *testing.T) {
+	tests := []struct {
+		name       string
+		hash       []byte
+		difficulty uint8
+		want       bool
+	}{
+		{"0 difficulty", []byte{0xFF}, 0, true},
+		{"8 zeros pass", []byte{0x00, 0xFF}, 8, true},
+		{"8 zeros fail", []byte{0x01, 0xFF}, 8, false},
+		{"4 zeros pass", []byte{0x0F}, 4, true},
+		{"4 zeros fail", []byte{0x1F}, 4, false},
+		{"16 zeros pass", []byte{0x00, 0x00, 0xFF}, 16, true},
+		{"16 zeros fail", []byte{0x00, 0x01, 0xFF}, 16, false},
+		{"12 zeros pass", []byte{0x00, 0x0F}, 12, true},
+		{"12 zeros fail", []byte{0x00, 0x10}, 12, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := checkLeadingZeros(tt.hash, tt.difficulty); got != tt.want {
+				t.Fatalf("checkLeadingZeros = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

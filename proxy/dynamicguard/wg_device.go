@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 
@@ -52,17 +53,19 @@ func (e *DGEndpoint) DstToBytes() []byte {
 
 // DGBind 实现 conn.Bind 接口，从外部 channel 接收 WG 报文
 type DGBind struct {
-	incoming chan *ReceivedPacket
-	udpConn  *net.UDPConn
-	mu       sync.Mutex
-	closed   bool
+	incoming    chan *ReceivedPacket
+	udpConn     *net.UDPConn
+	deviceTable *DeviceTable
+	mu          sync.Mutex
+	closed      bool
 }
 
 // NewDGBind 创建自定义 Bind
-func NewDGBind(udpConn *net.UDPConn) *DGBind {
+func NewDGBind(udpConn *net.UDPConn, deviceTable *DeviceTable) *DGBind {
 	return &DGBind{
-		incoming: make(chan *ReceivedPacket, 1024),
-		udpConn:  udpConn,
+		incoming:    make(chan *ReceivedPacket, 1024),
+		udpConn:     udpConn,
+		deviceTable: deviceTable,
 	}
 }
 
@@ -126,12 +129,13 @@ func (b *DGBind) BatchSize() int { return 1 }
 
 // WGDevice 封装 wireguard-go 设备（使用内核 TUN）
 type WGDevice struct {
-	device     *device.Device
-	bind       *DGBind
-	tunName    string
-	privateKey [32]byte
-	mu         sync.Mutex
-	lastStats  map[[32]byte]peerTraffic // 上次采集的 peer 流量
+	device      *device.Device
+	bind        *DGBind
+	tunName     string
+	privateKey  [32]byte
+	deviceTable *DeviceTable
+	mu          sync.Mutex
+	lastStats   map[[32]byte]peerTraffic // 上次采集的 peer 流量
 }
 
 type peerTraffic struct {
@@ -166,7 +170,7 @@ func NewWGDevice(cfg *WGDeviceConfig) (*WGDevice, error) {
 	}).Info("[DynamicGuard] created TUN device")
 
 	// 创建自定义 bind
-	bind := NewDGBind(cfg.UDPConn)
+	bind := NewDGBind(cfg.UDPConn, nil) // deviceTable 在创建后注入
 
 	// wireguard-go 日志
 	wgLogger := &device.Logger{
@@ -193,19 +197,26 @@ func NewWGDevice(cfg *WGDeviceConfig) (*WGDevice, error) {
 		return nil, fmt.Errorf("device up: %w", err)
 	}
 
-	// 配置系统网络（ip addr + iptables NAT + ip_forward）
+	// 配置系统网络（ip addr + ip_forward）
 	if err := configureNetwork(tunName, cfg.TunnelAddrs, cfg.Prefixes); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("configure network: %w", err)
 	}
 
 	return &WGDevice{
-		device:     dev,
-		bind:       bind,
-		tunName:    tunName,
-		privateKey: cfg.PrivateKey,
-		lastStats:  make(map[[32]byte]peerTraffic),
+		device:      dev,
+		bind:        bind,
+		tunName:     tunName,
+		privateKey:  cfg.PrivateKey,
+		deviceTable: nil, // 在 server 初始化后通过 SetDeviceTable 注入
+		lastStats:   make(map[[32]byte]peerTraffic),
 	}, nil
+}
+
+// SetDeviceTable 注入设备表引用（在 server 初始化完成后调用）
+func (w *WGDevice) SetDeviceTable(dt *DeviceTable) {
+	w.deviceTable = dt
+	w.bind.deviceTable = dt
 }
 
 // configureNetwork 配置内核 TUN 的地址和路由
@@ -304,6 +315,7 @@ func (w *WGDevice) GetBind() *DGBind {
 }
 
 // CollectTrafficDelta 通过 WG IPC 读取 peer 流量统计，返回增量
+// 同时更新有流量的 peer 对应设备的 last_seen（协议第 14 节）
 // 返回 map[peer_pubkey][upload, download]
 func (w *WGDevice) CollectTrafficDelta() map[[32]byte][2]int64 {
 	w.mu.Lock()
@@ -317,6 +329,7 @@ func (w *WGDevice) CollectTrafficDelta() map[[32]byte][2]int64 {
 
 	currentStats := parsePeerStats(buf.String())
 	result := make(map[[32]byte][2]int64)
+	now := time.Now()
 
 	for pubKey, stats := range currentStats {
 		prev := w.lastStats[pubKey]
@@ -333,6 +346,10 @@ func (w *WGDevice) CollectTrafficDelta() map[[32]byte][2]int64 {
 		}
 		if deltaRx > 0 || deltaTx > 0 {
 			result[pubKey] = [2]int64{deltaRx, deltaTx}
+			// 有流量 → 更新 last_seen，防止活跃设备被错误过期
+			if w.deviceTable != nil {
+				w.deviceTable.UpdateLastSeen(pubKey, now)
+			}
 		}
 		w.lastStats[pubKey] = stats
 	}

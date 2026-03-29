@@ -279,6 +279,16 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 	// Step 11: WireGuard AddPeer
 	if err := h.wgDevice.AddPeer(msg.WGStaticPub, assignedIP); err != nil {
 		log.Errorf("[DynamicGuard] WG AddPeer failed: %v", err)
+		// 回滚：释放分配的 IP 和设备记录
+		if pool, ok := h.ipPools[user.GroupID]; ok {
+			pool.Release(assignedIP)
+		}
+		if entry != nil {
+			// 如果是新设备，需要移除设备记录
+			// 如果是重连设备，需要清除重新分配的 IP
+			entry.AssignedIP = netip.Addr{}
+			entry.Status = DeviceStatusDisconnected
+		}
 		return
 	}
 

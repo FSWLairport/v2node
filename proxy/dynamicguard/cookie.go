@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"net"
 	"sync"
 	"time"
 )
@@ -102,7 +103,13 @@ func (cm *CookieManager) rotateSecret() {
 
 func computeCookie(srcIP []byte, srcPort uint16, secret [32]byte) [32]byte {
 	h := hmac.New(sha256.New, secret[:])
-	h.Write(srcIP)
+	// 归一化 IP：IPv4-mapped IPv6 → 4 字节 IPv4，避免双栈不一致
+	normalized := net.IP(srcIP)
+	if v4 := normalized.To4(); v4 != nil {
+		h.Write(v4)
+	} else {
+		h.Write(normalized.To16())
+	}
 	portBuf := make([]byte, 2)
 	binary.BigEndian.PutUint16(portBuf, srcPort)
 	h.Write(portBuf)
