@@ -176,8 +176,8 @@ func (dt *DeviceTable) Remove(entry *DeviceEntry) {
 
 // ExpiredDevice 过期设备信息，携带旧 IP 用于资源释放
 type ExpiredDevice struct {
-	Entry   *DeviceEntry
-	OldIP   netip.Addr
+	Entry *DeviceEntry
+	OldIP netip.Addr
 }
 
 // CleanExpired 将过期设备标记为 disconnected，从 IP 索引中移除，但保留设备记录

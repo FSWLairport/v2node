@@ -51,8 +51,8 @@ func TestCookieIPv4MappedIPv6Consistency(t *testing.T) {
 	cm := NewCookieManager(true, 0)
 
 	// 同一客户端，纯 IPv4 和 IPv4-mapped IPv6 两种表示
-	ipv4 := net.ParseIP("192.168.1.1").To4()     // 4 bytes
-	mapped := net.ParseIP("::ffff:192.168.1.1")   // 16 bytes IPv4-mapped
+	ipv4 := net.ParseIP("192.168.1.1").To4()    // 4 bytes
+	mapped := net.ParseIP("::ffff:192.168.1.1") // 16 bytes IPv4-mapped
 
 	cookie := cm.GenerateCookie(ipv4, 8080)
 	if !cm.VerifyCookie(cookie, mapped, 8080) {
