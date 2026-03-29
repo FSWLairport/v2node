@@ -71,16 +71,31 @@ func NewDGBind(udpConn *net.UDPConn, deviceTable *DeviceTable) *DGBind {
 
 // Deliver 将分流后的 WG 报文送入 bind
 func (b *DGBind) Deliver(pkt *ReceivedPacket) {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
+	ch := b.incoming
+	b.mu.Unlock()
+
 	select {
-	case b.incoming <- pkt:
+	case ch <- pkt:
 	default:
 		// 队列满，丢弃
 	}
 }
 
 func (b *DGBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
+	b.mu.Lock()
+	// wireguard-go 在 BindUpdate 时先 Close 再 Open，需要重建 channel
+	b.incoming = make(chan *ReceivedPacket, 1024)
+	b.closed = false
+	ch := b.incoming
+	b.mu.Unlock()
+
 	recvFn := func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
-		pkt, ok := <-b.incoming
+		pkt, ok := <-ch
 		if !ok {
 			return 0, net.ErrClosed
 		}
