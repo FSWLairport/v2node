@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -45,6 +46,8 @@ type DGServer struct {
 	serverWGPriv [32]byte
 	leaseTTL     uint32
 	stopCh       chan struct{}
+	readLoopDone sync.WaitGroup
+	closeOnce    sync.Once
 }
 
 // NewDGServer 创建 DG 服务端
@@ -108,6 +111,10 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen UDP: %w", err)
 	}
+
+	// 增大 socket 缓冲区，减少突发流量下的内核丢包
+	udpConn.SetReadBuffer(4 << 20)
+	udpConn.SetWriteBuffer(4 << 20)
 
 	// 收集所有 IP 池的网关地址和子网前缀
 	var tunnelAddrs []netip.Addr
@@ -210,6 +217,7 @@ func (s *DGServer) Start() error {
 	s.leaseMgr.Start()
 
 	// 启动 UDP 读取循环
+	s.readLoopDone.Add(1)
 	go s.readLoop()
 
 	log.WithFields(log.Fields{
@@ -266,33 +274,33 @@ func (s *DGServer) RemoveUser(userID int) {
 
 // Close 关闭 DG 服务端
 func (s *DGServer) Close() {
-	listenAddr := ""
-	if s.udpConn != nil && s.udpConn.LocalAddr() != nil {
-		listenAddr = s.udpConn.LocalAddr().String()
-	}
-	close(s.stopCh)
-	s.leaseMgr.Close()
-	s.idemCache.Close()
-	s.wgDevice.Close()
-	s.udpConn.Close()
-	log.WithField("listen", listenAddr).Info("[DynamicGuard] server closed")
+	s.closeOnce.Do(func() {
+		listenAddr := ""
+		if s.udpConn != nil && s.udpConn.LocalAddr() != nil {
+			listenAddr = s.udpConn.LocalAddr().String()
+		}
+
+		close(s.stopCh)
+		s.udpConn.Close()     // 解除 readLoop 中 ReadFromUDPAddrPort 的阻塞
+		s.readLoopDone.Wait() // 确保 readLoop 退出后再关闭下游子系统
+		s.leaseMgr.Close()
+		s.idemCache.Close()
+		s.wgDevice.Close()
+
+		log.WithField("listen", listenAddr).Info("[DynamicGuard] server closed")
+	})
 }
 
 func (s *DGServer) readLoop() {
-	buf := make([]byte, 65536)
-	for {
-		select {
-		case <-s.stopCh:
-			return
-		default:
-		}
+	defer s.readLoopDone.Done()
 
-		s.udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, addr, err := s.udpConn.ReadFromUDP(buf)
+	for {
+		bufPtr := pktPool.Get().(*[]byte)
+		buf := *bufPtr
+
+		n, addrPort, err := s.udpConn.ReadFromUDPAddrPort(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
+			pktPool.Put(bufPtr)
 			select {
 			case <-s.stopCh:
 				return
@@ -303,24 +311,29 @@ func (s *DGServer) readLoop() {
 		}
 
 		if n < 5 {
-			continue // 太短，丢弃
+			pktPool.Put(bufPtr)
+			continue
 		}
 
-		// 复制数据以避免并发问题
-		data := make([]byte, n)
-		copy(data, buf[:n])
+		data := buf[:n]
 
-		// 按首字节分流
 		if IsDynamicGuardPacket(data) {
-			go s.handler.HandleClientInit(data, addr, s.udpConn)
+			// DG 握手（低频）：拷贝数据后立即归还池缓冲区
+			dgData := make([]byte, n)
+			copy(dgData, data)
+			pktPool.Put(bufPtr)
+			udpAddr := net.UDPAddrFromAddrPort(addrPort)
+			go s.handler.HandleClientInit(dgData, udpAddr, s.udpConn)
 		} else if IsWireGuardPacket(data) {
-			// 送入 WG Bind channel
+			// WG 数据（高频热路径）：零拷贝送入 bind，由 recvFn 归还缓冲区
 			s.wgDevice.GetBind().Deliver(&ReceivedPacket{
 				Data: data,
-				Addr: addr,
+				Addr: addrPort,
+				buf:  bufPtr,
 			})
+		} else {
+			pktPool.Put(bufPtr)
 		}
-		// 其他情况静默丢弃
 	}
 }
 

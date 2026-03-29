@@ -23,31 +23,30 @@ import (
 // ReceivedPacket 从 UDP 分流后的 WireGuard 报文
 type ReceivedPacket struct {
 	Data []byte
-	Addr *net.UDPAddr
+	Addr netip.AddrPort
+	buf  *[]byte // 池化缓冲区指针，recvFn 处理完后归还到 pktPool
 }
 
-// DGEndpoint 实现 conn.Endpoint 接口
+// pktPool 复用 readLoop 的读缓冲区，消除每包堆分配
+var pktPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 65536)
+		return &b
+	},
+}
+
+// DGEndpoint 实现 conn.Endpoint 接口（使用值类型 netip.AddrPort 避免逃逸）
 type DGEndpoint struct {
-	dst *net.UDPAddr
-	src *net.UDPAddr
+	dst netip.AddrPort
 }
 
-func (e *DGEndpoint) ClearSrc()           { e.src = nil }
+func (e *DGEndpoint) ClearSrc()           {}
 func (e *DGEndpoint) SrcToString() string { return "" }
 func (e *DGEndpoint) DstToString() string { return e.dst.String() }
-func (e *DGEndpoint) DstIP() netip.Addr {
-	addr, _ := netip.AddrFromSlice(e.dst.IP)
-	return addr
-}
-func (e *DGEndpoint) SrcIP() netip.Addr {
-	if e.src == nil {
-		return netip.Addr{}
-	}
-	addr, _ := netip.AddrFromSlice(e.src.IP)
-	return addr
-}
+func (e *DGEndpoint) DstIP() netip.Addr   { return e.dst.Addr() }
+func (e *DGEndpoint) SrcIP() netip.Addr   { return netip.Addr{} }
 func (e *DGEndpoint) DstToBytes() []byte {
-	b, _ := e.dst.AddrPort().MarshalBinary()
+	b, _ := e.dst.MarshalBinary()
 	return b
 }
 
@@ -63,7 +62,7 @@ type DGBind struct {
 // NewDGBind 创建自定义 Bind
 func NewDGBind(udpConn *net.UDPConn, deviceTable *DeviceTable) *DGBind {
 	return &DGBind{
-		incoming:    make(chan *ReceivedPacket, 1024),
+		incoming:    make(chan *ReceivedPacket, 4096),
 		udpConn:     udpConn,
 		deviceTable: deviceTable,
 	}
@@ -74,6 +73,10 @@ func (b *DGBind) Deliver(pkt *ReceivedPacket) {
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
+		if pkt.buf != nil {
+			pktPool.Put(pkt.buf)
+			pkt.buf = nil
+		}
 		return
 	}
 	ch := b.incoming
@@ -82,14 +85,18 @@ func (b *DGBind) Deliver(pkt *ReceivedPacket) {
 	select {
 	case ch <- pkt:
 	default:
-		// 队列满，丢弃
+		// 队列满：归还池化缓冲区
+		if pkt.buf != nil {
+			pktPool.Put(pkt.buf)
+			pkt.buf = nil
+		}
 	}
 }
 
 func (b *DGBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.mu.Lock()
 	// wireguard-go 在 BindUpdate 时先 Close 再 Open，需要重建 channel
-	b.incoming = make(chan *ReceivedPacket, 1024)
+	b.incoming = make(chan *ReceivedPacket, 4096)
 	b.closed = false
 	ch := b.incoming
 	b.mu.Unlock()
@@ -102,6 +109,11 @@ func (b *DGBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		n := copy(packets[0], pkt.Data)
 		sizes[0] = n
 		eps[0] = &DGEndpoint{dst: pkt.Addr}
+		// 归还池化缓冲区
+		if pkt.buf != nil {
+			pktPool.Put(pkt.buf)
+			pkt.buf = nil
+		}
 		return 1, nil
 	}
 	return []conn.ReceiveFunc{recvFn}, 0, nil
@@ -112,7 +124,18 @@ func (b *DGBind) Close() error {
 	defer b.mu.Unlock()
 	if !b.closed {
 		b.closed = true
-		close(b.incoming)
+		// 排空残留报文，归还池化缓冲区
+		for {
+			select {
+			case pkt := <-b.incoming:
+				if pkt.buf != nil {
+					pktPool.Put(pkt.buf)
+				}
+			default:
+				close(b.incoming)
+				return nil
+			}
+		}
 	}
 	return nil
 }
@@ -125,7 +148,7 @@ func (b *DGBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		return fmt.Errorf("invalid endpoint type")
 	}
 	for _, buf := range bufs {
-		if _, err := b.udpConn.WriteToUDP(buf, dgEp.dst); err != nil {
+		if _, err := b.udpConn.WriteToUDPAddrPort(buf, dgEp.dst); err != nil {
 			return err
 		}
 	}
@@ -133,11 +156,11 @@ func (b *DGBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 }
 
 func (b *DGBind) ParseEndpoint(s string) (conn.Endpoint, error) {
-	addr, err := net.ResolveUDPAddr("udp", s)
+	ap, err := netip.ParseAddrPort(s)
 	if err != nil {
 		return nil, err
 	}
-	return &DGEndpoint{dst: addr}, nil
+	return &DGEndpoint{dst: ap}, nil
 }
 
 func (b *DGBind) BatchSize() int { return 1 }
@@ -241,6 +264,15 @@ func configureNetwork(tunName string, addrs []netip.Addr, prefixes []netip.Prefi
 		return fmt.Errorf("ip link set up: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	log.WithField("tun", tunName).Info("[DynamicGuard] TUN link is up")
+
+	// 增大 TUN 发送队列，减少高吞吐时的丢包
+	if out, err := exec.Command("ip", "link", "set", tunName, "txqueuelen", "1000").CombinedOutput(); err != nil {
+		log.WithFields(log.Fields{
+			"tun": tunName,
+			"err": err,
+			"out": strings.TrimSpace(string(out)),
+		}).Warn("[DynamicGuard] failed to set txqueuelen")
+	}
 
 	// 添加 IP 地址（每个 IP 池的网关地址，同时自动创建连接路由）
 	for i, addr := range addrs {
