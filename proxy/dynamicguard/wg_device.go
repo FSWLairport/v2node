@@ -22,9 +22,10 @@ import (
 
 // ReceivedPacket 从 UDP 分流后的 WireGuard 报文
 type ReceivedPacket struct {
-	Data []byte
-	Addr netip.AddrPort
-	buf  *[]byte // 池化缓冲区指针，recvFn 处理完后归还到 pktPool
+	Data      []byte
+	Addr      netip.AddrPort
+	LocalAddr netip.Addr // 收包时本地目的 IP（源进源出）
+	buf       *[]byte    // 池化缓冲区指针，recvFn 处理完后归还到 pktPool
 }
 
 // pktPool 复用 readLoop 的读缓冲区，消除每包堆分配
@@ -38,13 +39,21 @@ var pktPool = sync.Pool{
 // DGEndpoint 实现 conn.Endpoint 接口（使用值类型 netip.AddrPort 避免逃逸）
 type DGEndpoint struct {
 	dst netip.AddrPort
+	src netip.Addr // 收包时的本地 IP（源进源出；roaming 时由 ClearSrc 清除）
 }
 
-func (e *DGEndpoint) ClearSrc()           {}
-func (e *DGEndpoint) SrcToString() string { return "" }
+// ClearSrc 在 wireguard-go 检测到 endpoint roaming 时调用，清除旧的本地源 IP。
+// 下次 recvFn 返回新 endpoint 时会带上新的 src。
+func (e *DGEndpoint) ClearSrc() { e.src = netip.Addr{} }
+func (e *DGEndpoint) SrcToString() string {
+	if e.src.IsValid() {
+		return e.src.String()
+	}
+	return ""
+}
 func (e *DGEndpoint) DstToString() string { return e.dst.String() }
 func (e *DGEndpoint) DstIP() netip.Addr   { return e.dst.Addr() }
-func (e *DGEndpoint) SrcIP() netip.Addr   { return netip.Addr{} }
+func (e *DGEndpoint) SrcIP() netip.Addr   { return e.src }
 func (e *DGEndpoint) DstToBytes() []byte {
 	b, _ := e.dst.MarshalBinary()
 	return b
@@ -108,7 +117,7 @@ func (b *DGBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		}
 		n := copy(packets[0], pkt.Data)
 		sizes[0] = n
-		eps[0] = &DGEndpoint{dst: pkt.Addr}
+		eps[0] = &DGEndpoint{dst: pkt.Addr, src: pkt.LocalAddr}
 		// 归还池化缓冲区
 		if pkt.buf != nil {
 			pktPool.Put(pkt.buf)
@@ -147,9 +156,17 @@ func (b *DGBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	if !ok {
 		return fmt.Errorf("invalid endpoint type")
 	}
+	// 源进源出：用收包时的本地 IP 作为回包源 IP
+	oob := buildSrcOOB(dgEp.src)
 	for _, buf := range bufs {
-		if _, err := b.udpConn.WriteToUDPAddrPort(buf, dgEp.dst); err != nil {
-			return err
+		if oob != nil {
+			if _, _, err := b.udpConn.WriteMsgUDPAddrPort(buf, oob, dgEp.dst); err != nil {
+				return err
+			}
+		} else {
+			if _, err := b.udpConn.WriteToUDPAddrPort(buf, dgEp.dst); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

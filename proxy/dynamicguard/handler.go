@@ -61,7 +61,7 @@ func NewHandler(cfg *HandlerConfig) *Handler {
 }
 
 // HandleClientInit 处理 ClientInit 报文（协议第 9 节 14 步）
-func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *net.UDPConn) {
+func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *net.UDPConn, localAddr netip.Addr) {
 	h.pendingCount.Add(1)
 	defer h.pendingCount.Add(-1)
 
@@ -126,7 +126,7 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 			if h.pendingCount.Load() > int64(highLoadThreshold) {
 				cookie := h.cookieMgr.GenerateCookie(srcAddr.IP, uint16(srcAddr.Port))
 				reply := BuildCookieReply(cookie, h.cookieMgr.GetPowDifficulty())
-				udpConn.WriteToUDP(reply, srcAddr)
+				writeUDPWithSrc(udpConn, reply, srcAddr, localAddr)
 				log.WithFields(log.Fields{
 					"src":              srcAddr.String(),
 					"user_id":          user.UserID,
@@ -151,7 +151,7 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 	// Step 7: 幂等缓存检查
 	idemKey := ComputeIdempotencyKey(msg.UserKey, msg.DeviceID, msg.EphPub, msg.WGStaticPub, msg.ClientNonce)
 	if cached, ok := h.idemCache.Get(idemKey); ok {
-		udpConn.WriteToUDP(cached, srcAddr)
+		writeUDPWithSrc(udpConn, cached, srcAddr, localAddr)
 		log.WithFields(log.Fields{
 			"src":     srcAddr.String(),
 			"user_id": user.UserID,
@@ -335,7 +335,7 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 		return
 	}
 
-	if _, err := udpConn.WriteToUDP(reply, srcAddr); err != nil {
+	if _, err := writeUDPWithSrc(udpConn, reply, srcAddr, localAddr); err != nil {
 		log.Debugf("[DynamicGuard] send reply failed: %v", err)
 		return
 	}

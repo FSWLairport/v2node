@@ -116,6 +116,12 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 	udpConn.SetReadBuffer(4 << 20)
 	udpConn.SetWriteBuffer(4 << 20)
 
+	// 启用 IP_PKTINFO，使收包时能获取本地目的 IP（源进源出）
+	if err := enablePktInfo(udpConn); err != nil {
+		udpConn.Close()
+		return nil, fmt.Errorf("enable pktinfo: %w", err)
+	}
+
 	// 收集所有 IP 池的网关地址和子网前缀
 	var tunnelAddrs []netip.Addr
 	var ipPrefixes []netip.Prefix
@@ -294,11 +300,13 @@ func (s *DGServer) Close() {
 func (s *DGServer) readLoop() {
 	defer s.readLoopDone.Done()
 
+	oobBuf := make([]byte, pktInfoOOBSize)
+
 	for {
 		bufPtr := pktPool.Get().(*[]byte)
 		buf := *bufPtr
 
-		n, addrPort, err := s.udpConn.ReadFromUDPAddrPort(buf)
+		n, oobn, _, addrPort, err := s.udpConn.ReadMsgUDPAddrPort(buf, oobBuf)
 		if err != nil {
 			pktPool.Put(bufPtr)
 			select {
@@ -315,6 +323,9 @@ func (s *DGServer) readLoop() {
 			continue
 		}
 
+		// 解析收包时的本地目的 IP（源进源出）
+		localAddr := parseLocalAddr(oobBuf, oobn)
+
 		data := buf[:n]
 
 		if IsDynamicGuardPacket(data) {
@@ -323,13 +334,14 @@ func (s *DGServer) readLoop() {
 			copy(dgData, data)
 			pktPool.Put(bufPtr)
 			udpAddr := net.UDPAddrFromAddrPort(addrPort)
-			go s.handler.HandleClientInit(dgData, udpAddr, s.udpConn)
+			go s.handler.HandleClientInit(dgData, udpAddr, s.udpConn, localAddr)
 		} else if IsWireGuardPacket(data) {
 			// WG 数据（高频热路径）：零拷贝送入 bind，由 recvFn 归还缓冲区
 			s.wgDevice.GetBind().Deliver(&ReceivedPacket{
-				Data: data,
-				Addr: addrPort,
-				buf:  bufPtr,
+				Data:      data,
+				Addr:      addrPort,
+				LocalAddr: localAddr,
+				buf:       bufPtr,
 			})
 		} else {
 			pktPool.Put(bufPtr)
