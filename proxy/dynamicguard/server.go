@@ -89,14 +89,20 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		return nil, err
 	}
 
-	// 创建 IP 池
+	// 创建 IP 池（相同 CIDR 的多个 group 共享同一实例，避免重叠分配）
+	cidrToPool := make(map[string]*IPPool)
 	ipPools := make(map[int]*IPPool)
 	for groupStr, cidr := range settings.IPPools {
 		groupID := 0
 		fmt.Sscanf(groupStr, "%d", &groupID)
-		pool, err := NewIPPool(cidr)
-		if err != nil {
-			return nil, fmt.Errorf("create IP pool for group %s (%s): %w", groupStr, cidr, err)
+		pool, exists := cidrToPool[cidr]
+		if !exists {
+			var err error
+			pool, err = NewIPPool(cidr)
+			if err != nil {
+				return nil, fmt.Errorf("create IP pool for group %s (%s): %w", groupStr, cidr, err)
+			}
+			cidrToPool[cidr] = pool
 		}
 		ipPools[groupID] = pool
 		log.Infof("[DynamicGuard] IP pool group=%d cidr=%s", groupID, cidr)
