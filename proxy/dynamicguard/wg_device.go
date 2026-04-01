@@ -297,7 +297,7 @@ func configureNetwork(tunName string, addrs []netip.Addr, prefixes []netip.Prefi
 		cidr := fmt.Sprintf("%s/%d", addr, bits)
 		if out, err := exec.Command("ip", "addr", "add", cidr, "dev", tunName).CombinedOutput(); err != nil {
 			outStr := strings.TrimSpace(string(out))
-			if !strings.Contains(outStr, "File exists") {
+			if !strings.Contains(outStr, "File exists") && !strings.Contains(outStr, "Address already assigned") {
 				return fmt.Errorf("ip addr add %s: %s: %w", cidr, outStr, err)
 			}
 		}

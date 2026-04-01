@@ -128,10 +128,15 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		return nil, fmt.Errorf("enable pktinfo: %w", err)
 	}
 
-	// 收集所有 IP 池的网关地址和子网前缀
+	// 收集所有 IP 池的网关地址和子网前缀（按 CIDR 去重，共享池只处理一次）
 	var tunnelAddrs []netip.Addr
 	var ipPrefixes []netip.Prefix
+	seenPool := make(map[*IPPool]struct{})
 	for _, pool := range ipPools {
+		if _, dup := seenPool[pool]; dup {
+			continue
+		}
+		seenPool[pool] = struct{}{}
 		gwAddr := pool.network.Addr().Next()
 		tunnelAddrs = append(tunnelAddrs, gwAddr)
 		ipPrefixes = append(ipPrefixes, pool.network)
