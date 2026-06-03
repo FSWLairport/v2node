@@ -36,10 +36,37 @@ var pktPool = sync.Pool{
 	},
 }
 
+// dynamicGuardReserved 是 DynamicGuard 专属的 WireGuard reserved 字段标记 "SKY"。
+// 必须与客户端 sing-box protocol/dynamicguard/endpoint.go 中的 dynamicGuardReserved 保持一致。
+//
+// WireGuard 报文前 4 字节被 wireguard-go 当作 LittleEndian uint32 读取 message type，
+// reserved 占据其高 3 字节（msg[1:4]）。因此：
+//   - 入站（recvFn）：交给 wireguard-go 前必须清零 msg[1:4]，否则 type 校验失败丢包，握手中断。
+//   - 出站（Send）：写 UDP 前盖上该标记，与客户端对称伪装。
+//
+// 仅作用于 DynamicGuard 的 WG 报文（type 0x01..0x04），不影响普通 WireGuard。
+var dynamicGuardReserved = [3]byte{0x53, 0x4B, 0x59}
+
+// dgReservedPayload 是 reserved 通道当前承载的明文元数据（预留给未来 dgVersion 等协商）。
+// 现阶段全 0：经 dgXorReserved 编码后产出 == dynamicGuardReserved("SKY")，
+// 因此线上字节与固定 "SKY" 完全一致，本次改动对 wire 零影响。
+var dgReservedPayload = [3]byte{0, 0, 0}
+
+// dgXorReserved 对 reserved 三字节做 XOR 编解码（与 key 异或，自反：encode==decode）。
+//   - 出站：dgXorReserved(payload, key) 得到伪装后的 reserved 字节。
+//   - 入站：dgXorReserved(wire, key) 还原出 payload 明文。
+//
+// key 固定为 dynamicGuardReserved，须与客户端保持一致。
+func dgXorReserved(v, key [3]byte) [3]byte {
+	return [3]byte{v[0] ^ key[0], v[1] ^ key[1], v[2] ^ key[2]}
+}
+
 // DGEndpoint 实现 conn.Endpoint 接口（使用值类型 netip.AddrPort 避免逃逸）
 type DGEndpoint struct {
-	dst netip.AddrPort
-	src netip.Addr // 收包时的本地 IP（源进源出；roaming 时由 ClearSrc 清除）
+	dst             netip.AddrPort
+	src             netip.Addr // 收包时的本地 IP（源进源出；roaming 时由 ClearSrc 清除）
+	transformType   bool       // 上行 type 是否被 mask（0x81..0x84），用于下行镜像伪装
+	reservedPayload [3]byte    // 入站从 reserved 解码出的明文元数据（预留给 dgVersion 协商）
 }
 
 // ClearSrc 在 wireguard-go 检测到 endpoint roaming 时调用，清除旧的本地源 IP。
@@ -117,7 +144,24 @@ func (b *DGBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		}
 		n := copy(packets[0], pkt.Data)
 		sizes[0] = n
-		eps[0] = &DGEndpoint{dst: pkt.Addr, src: pkt.LocalAddr}
+		// 入站 type 还原 + 清零 reserved：客户端发来的 WG 报文可能带有 DPI 伪装
+		// type mask（0x81..0x84），须在交给 wireguard-go 前还原为 0x01..0x04 并
+		// 清零 reserved（msg[1:4]），否则 uint32 读出无效 type 导致丢包。
+		var masked bool
+		var rpayload [3]byte
+		if n >= 4 {
+			b0 := packets[0][0]
+			masked = b0 >= 0x81 && b0 <= 0x84
+			if (b0 >= 0x01 && b0 <= 0x04) || masked {
+				// 清零前从 reserved 解码出 payload 明文（预留给 dgVersion 等元数据）
+				rpayload = dgXorReserved([3]byte{packets[0][1], packets[0][2], packets[0][3]}, dynamicGuardReserved)
+				packets[0][0] = b0 & 0x7F
+				packets[0][1] = 0
+				packets[0][2] = 0
+				packets[0][3] = 0
+			}
+		}
+		eps[0] = &DGEndpoint{dst: pkt.Addr, src: pkt.LocalAddr, transformType: masked, reservedPayload: rpayload}
 		// 归还池化缓冲区
 		if pkt.buf != nil {
 			pktPool.Put(pkt.buf)
@@ -159,6 +203,18 @@ func (b *DGBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	// 源进源出：用收包时的本地 IP 作为回包源 IP
 	oob := buildSrcOOB(dgEp.src)
 	for _, buf := range bufs {
+		// 出站盖戳 + DPI 伪装：对 WG 报文（type 0x01..0x04）镜像上行 type mask
+		// 并写入 DynamicGuard reserved 标记 "SKY"。wireguard-go 构造时 msg[1:4] 为 0。
+		if len(buf) >= 4 && buf[0] >= 0x01 && buf[0] <= 0x04 {
+			if dgEp.transformType {
+				buf[0] |= 0x80
+			}
+			// reserved 通道编码 payload（XOR key）；payload 全 0 时产出 == "SKY"，与原固定值一致
+			enc := dgXorReserved(dgReservedPayload, dynamicGuardReserved)
+			buf[1] = enc[0]
+			buf[2] = enc[1]
+			buf[3] = enc[2]
+		}
 		if oob != nil {
 			if _, _, err := b.udpConn.WriteMsgUDPAddrPort(buf, oob, dgEp.dst); err != nil {
 				return err
