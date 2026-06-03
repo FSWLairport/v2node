@@ -65,7 +65,7 @@ func IsWireGuardPacket(data []byte) bool {
 	if len(data) < 1 {
 		return false
 	}
-	return data[0] >= 0x01 && data[0] <= 0x04
+	return (data[0] >= 0x01 && data[0] <= 0x04) || (data[0] >= 0x81 && data[0] <= 0x84)
 }
 
 // ParseClientInit 解析 ClientInit 报文
