@@ -69,7 +69,7 @@ DynamicGuard 与 WireGuard 共享同一个 UDP 端口。服务端按以下规则
 
 1. 若报文长度不足 5 字节，丢弃
 2. 若首 4 字节为 `0x44 0x47 0x30 0x31`（ASCII `"DG01"`），且长度满足对应消息最小长度，交给 DynamicGuard
-3. 若首字节为 `0x01` / `0x02` / `0x03` / `0x04`，交给 WireGuard
+3. 若首字节为 `0x01`-`0x04` 或 `0x81`-`0x84`，交给 WireGuard（`0x81`-`0x84` 为经混淆层方向标记的 WireGuard 报文，详见第 25 节）
 4. 其他情况丢弃
 
 ---
@@ -726,3 +726,68 @@ DynamicGuard 在 sing-box 中作为 **endpoint** 类型实现，类型名为 `dy
   ]
 }
 ```
+
+---
+
+## 25. WireGuard 混淆层
+
+DynamicGuard 握手完成后承载的是标准 WireGuard 流量。为消除 WireGuard 报文固定的握手大小与首字节指纹，客户端 bind 与服务端 bind 在 UDP 收发路径上对所有 WireGuard 报文施加对称混淆。混淆仅作用于 WireGuard 报文，DG01 控制报文不参与。
+
+### 25.1 obfs 密钥
+
+混淆使用一个 32 字节固定密钥 `dgObfsKey`，客户端与服务端硬编码且逐字节一致：
+
+```
+7E 3A 91 F5 0C 68 D4 B2 A1 5F E8 33 9C 47 6D 0A
+52 BD 1E 89 F4 C7 26 38 AF 09 E1 5B 77 2C 80 DF
+```
+
+该密钥独立于 `user_key` 与会话密钥，仅用于 reserved 字段的 HMAC 掩码，不参与任何机密性保证。
+
+### 25.2 reserved 元数据编码
+
+WireGuard 报文头部 4 字节为 `type(1) || reserved(3)`，标准 WireGuard 中 reserved 恒为 0。混淆层将 padding 长度与随机熵编码进 reserved 三字节：
+
+- `plain24 = padLen | (rand16 << 8)`：`padLen` 占 bit0-7（uint8），`rand16` 占 bit8-23（随机熵）
+- 掩码 `mask = HMAC-SHA256(dgObfsKey, [normType] || body)[0:3]`
+  - `normType` 为去除方向位后的类型（`b0 & 0x7F`）
+  - `body = wgMsg[4:baseLen]`，即 reserved 之后到基础长度之间的报文体
+- 写入 reserved 的三字节为 `plain24` 与 `mask` 按小端逐字节异或
+
+掩码仅覆盖报文体 `body`，不覆盖 reserved 自身，因此收发两端可各自确定地重算出同一掩码。
+
+各类型基础长度 `baseLen`：
+
+| type | 用途 | baseLen |
+|------|------|---------|
+| 0x01 | Handshake Initiation | 148 |
+| 0x02 | Handshake Response | 92 |
+| 0x03 | Cookie Reply | 64 |
+| 0x04 | Keepalive / Data | 32 |
+
+### 25.3 方向标记
+
+出站报文将首字节最高位置 1：`b0 = normType | 0x80`，得到 `0x81`-`0x84`。收端据此识别经混淆的对端报文，在交付 WireGuard 前还原 `normType = b0 & 0x7F` 并清零 reserved 三字节（WireGuard 解析要求 reserved 为 0）。
+
+### 25.4 Padding 规则
+
+报文是否追加尾部随机 padding 由类型决定：
+
+- type 0x01 / 0x02 / 0x03（握手类）：始终追加 padding
+- type 0x04：仅当长度等于 32（keepalive）时追加 padding；长度大于 32 的数据包不追加
+- padding 长度 `padLen ∈ [1, 96]`，由 `crypto/rand` 选取，内容为随机字节，追加在 `baseLen` 之后
+
+数据包（type 0x04 且长度大于 32）编码 `padLen = 0` 且不追加 padding，以避免增大 MTU 导致分片；`padLen = 0` 不落在 `[1, 96]` 区间，收端不会误判为可剥离。
+
+收端解码 `padLen`，当且仅当 `padLen ∈ [1, 96]` 且 `n == baseLen + padLen` 时剥离尾部 padding，将报文还原为 `baseLen` 后交付 WireGuard。
+
+### 25.5 anti-DPI junk
+
+客户端在每次建立到服务端的连接后，发送 0..3 个随机长度的垃圾包，以干扰 DPI 的流量时序与包长分布指纹：
+
+- 包数量 `jc ∈ [0, 3]`
+- 每包长度 `∈ [32, 256]`，内容为随机字节
+- 首字节强制落在 demux 范围之外，即避开 `0x44`（DG01 magic 首字节）、`0x01`-`0x04`、`0x81`-`0x84`
+- 包间随机延迟 `∈ [0, 25] ms`
+
+由于 junk 包首字节落在分流范围外，服务端按第 4 节端口复用规则直接丢弃，无需服务端参与，对协议状态无副作用。

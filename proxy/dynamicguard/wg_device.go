@@ -2,6 +2,9 @@ package dynamicguard
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -59,6 +62,96 @@ var dgReservedPayload = [3]byte{0, 0, 0}
 // key 固定为 dynamicGuardReserved，须与客户端保持一致。
 func dgXorReserved(v, key [3]byte) [3]byte {
 	return [3]byte{v[0] ^ key[0], v[1] ^ key[1], v[2] ^ key[2]}
+}
+
+// dgObfsKey 是 reserved 元数据 HMAC 掩码的 32 字节固定密钥。
+// 用于将 padLen + 熵编码到 WG reserved[1:4] 中，消除尾部 LV 指纹。
+// 必须与客户端 client_bind.go 的 dgObfsKey 逐字节一致。
+var dgObfsKey = [32]byte{
+	0x7E, 0x3A, 0x91, 0xF5, 0x0C, 0x68, 0xD4, 0xB2,
+	0xA1, 0x5F, 0xE8, 0x33, 0x9C, 0x47, 0x6D, 0x0A,
+	0x52, 0xBD, 0x1E, 0x89, 0xF4, 0xC7, 0x26, 0x38,
+	0xAF, 0x09, 0xE1, 0x5B, 0x77, 0x2C, 0x80, 0xDF,
+}
+
+const (
+	dgPadMax        = 96
+	dgPadMin        = 1
+	wgHandshakeInit = 148 // WG type 1
+	wgHandshakeResp = 92  // WG type 2
+	wgCookieReply   = 64  // WG type 3
+	wgKeepalive     = 32  // WG type 4 keepalive (data > 32)
+	dgJunkMin       = 32
+	dgJunkMax       = 256
+	dgJunkMaxCount  = 3
+)
+
+// wgBaseLen 返回 WG 消息类型对应的握手/keepalive 基础长度。
+func wgBaseLen(msgType byte) int {
+	switch msgType {
+	case 0x01:
+		return wgHandshakeInit
+	case 0x02:
+		return wgHandshakeResp
+	case 0x03:
+		return wgCookieReply
+	case 0x04:
+		return wgKeepalive
+	default:
+		return 0
+	}
+}
+
+// dgShouldPad 判断 WG 报文是否需要追加 anti-DPI padding。
+func dgShouldPad(msgType byte, msgLen int) bool {
+	switch msgType {
+	case 0x01, 0x02, 0x03:
+		return true
+	case 0x04:
+		return msgLen == wgKeepalive
+	default:
+		return false
+	}
+}
+
+// dgComputeMask 计算 reserved 元数据的 3 字节 HMAC 掩码。
+func dgComputeMask(normType byte, msgPayload []byte) [3]byte {
+	mac := hmac.New(sha256.New, dgObfsKey[:])
+	mac.Write([]byte{normType})
+	mac.Write(msgPayload)
+	sum := mac.Sum(nil)
+	return [3]byte{sum[0], sum[1], sum[2]}
+}
+
+// dgEncodeReserved 将 padLen + rand16 编码到 reserved 三字节（masked）。
+func dgEncodeReserved(normType byte, msgPayload []byte, padLen uint8, randU16 uint16) [3]byte {
+	plain24 := uint32(padLen) | uint32(randU16)<<8
+	mask := dgComputeMask(normType, msgPayload)
+	return [3]byte{
+		byte(plain24) ^ mask[0],
+		byte(plain24>>8) ^ mask[1],
+		byte(plain24>>16) ^ mask[2],
+	}
+}
+
+// dgDecodeReserved 从 masked reserved 三字节解码出 plain24。
+func dgDecodeReserved(normType byte, msgPayload []byte, wire [3]byte) (plain24 uint32) {
+	mask := dgComputeMask(normType, msgPayload)
+	return uint32(wire[0]^mask[0]) | uint32(wire[1]^mask[1])<<8 | uint32(wire[2]^mask[2])<<16
+}
+
+// randPadLen 返回 [dgPadMin, dgPadMax] 随机 pad 长度。
+func randPadLen() uint8 {
+	var b [1]byte
+	rand.Read(b[:])
+	return uint8(b[0]%byte(dgPadMax)) + dgPadMin
+}
+
+// randUint16 返回随机 uint16（crypto/rand）。
+func randUint16() uint16 {
+	var b [2]byte
+	rand.Read(b[:])
+	return uint16(b[0]) | uint16(b[1])<<8
 }
 
 // DGEndpoint 实现 conn.Endpoint 接口（使用值类型 netip.AddrPort 避免逃逸）
@@ -144,18 +237,32 @@ func (b *DGBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		}
 		n := copy(packets[0], pkt.Data)
 		sizes[0] = n
-		// 入站 type 还原 + 清零 reserved：客户端发来的 WG 报文可能带有 DPI 伪装
-		// type mask（0x81..0x84），须在交给 wireguard-go 前还原为 0x01..0x04 并
-		// 清零 reserved（msg[1:4]），否则 uint32 读出无效 type 导致丢包。
+
 		var masked bool
 		var rpayload [3]byte
 		if n >= 4 {
 			b0 := packets[0][0]
 			masked = b0 >= 0x81 && b0 <= 0x84
+			normType := b0 & 0x7F
+
 			if (b0 >= 0x01 && b0 <= 0x04) || masked {
-				// 清零前从 reserved 解码出 payload 明文（预留给 dgVersion 等元数据）
-				rpayload = dgXorReserved([3]byte{packets[0][1], packets[0][2], packets[0][3]}, dynamicGuardReserved)
-				packets[0][0] = b0 & 0x7F
+				baseLen := wgBaseLen(normType)
+
+				// 尝试从 HMAC-masked reserved 解码 padLen
+				if baseLen > 0 && n >= baseLen {
+					wire := [3]byte{packets[0][1], packets[0][2], packets[0][3]}
+					plain24 := dgDecodeReserved(normType, packets[0][4:baseLen], wire)
+					padLen := uint8(plain24 & 0xFF)
+					rpayload = [3]byte{byte(plain24), byte(plain24 >> 8), byte(plain24 >> 16)}
+
+					// 校验 padLen 合法且长度匹配 → strip padding
+					if padLen >= dgPadMin && padLen <= dgPadMax && n == baseLen+int(padLen) {
+						sizes[0] = baseLen
+					}
+				}
+
+				// 还原 type 并清零 reserved（WG 解析要求 reserved==0）
+				packets[0][0] = normType
 				packets[0][1] = 0
 				packets[0][2] = 0
 				packets[0][3] = 0
@@ -203,17 +310,54 @@ func (b *DGBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	// 源进源出：用收包时的本地 IP 作为回包源 IP
 	oob := buildSrcOOB(dgEp.src)
 	for _, buf := range bufs {
-		// 出站盖戳 + DPI 伪装：对 WG 报文（type 0x01..0x04）镜像上行 type mask
-		// 并写入 DynamicGuard reserved 标记 "SKY"。wireguard-go 构造时 msg[1:4] 为 0。
 		if len(buf) >= 4 && buf[0] >= 0x01 && buf[0] <= 0x04 {
+			normType := buf[0]
+
+			// 出站 type mask：镜像上行伪装（0x01..0x04 → 0x81..0x84）
 			if dgEp.transformType {
 				buf[0] |= 0x80
 			}
-			// reserved 通道编码 payload（XOR key）；payload 全 0 时产出 == "SKY"，与原固定值一致
-			enc := dgXorReserved(dgReservedPayload, dynamicGuardReserved)
-			buf[1] = enc[0]
-			buf[2] = enc[1]
-			buf[3] = enc[2]
+
+			if dgShouldPad(normType, len(buf)) {
+				// 握手（type 1/2/3）或 keepalive（type 4, len==32）：
+				// reserved[1:4] 用 HMAC-masked padLen + 熵编码，尾部追加随机 pad
+				baseLen := wgBaseLen(normType)
+				if baseLen > 0 && len(buf) >= baseLen {
+					padLen := randPadLen()
+					randU16 := randUint16()
+					enc := dgEncodeReserved(normType, buf[4:baseLen], padLen, randU16)
+					buf[1], buf[2], buf[3] = enc[0], enc[1], enc[2]
+
+					paddedLen := baseLen + int(padLen)
+					paddedBuf := make([]byte, paddedLen)
+					copy(paddedBuf[:baseLen], buf[:baseLen])
+					rand.Read(paddedBuf[baseLen:])
+
+					var err error
+					if oob != nil {
+						_, _, err = b.udpConn.WriteMsgUDPAddrPort(paddedBuf, oob, dgEp.dst)
+					} else {
+						_, err = b.udpConn.WriteToUDPAddrPort(paddedBuf, dgEp.dst)
+					}
+					if err != nil {
+						return err
+					}
+					continue
+				}
+				// 退化：回退到旧 reserved 编码
+				enc := dgXorReserved(dgReservedPayload, dynamicGuardReserved)
+				buf[1], buf[2], buf[3] = enc[0], enc[1], enc[2]
+			} else if normType == 0x04 && len(buf) > wgKeepalive {
+				// Type 4 data 报文：reserved 编码 padLen=0 + 熵，不加 padding
+				// 关键：编码 padLen=0 而非纯随机三字节，避免接收端把 data 误当作
+				// padded keepalive 截断到 32B（详见 client_bind.go 对称注释）。
+				enc := dgEncodeReserved(normType, buf[4:wgKeepalive], 0, randUint16())
+				buf[1], buf[2], buf[3] = enc[0], enc[1], enc[2]
+			} else {
+				// 其他：旧编码
+				enc := dgXorReserved(dgReservedPayload, dynamicGuardReserved)
+				buf[1], buf[2], buf[3] = enc[0], enc[1], enc[2]
+			}
 		}
 		if oob != nil {
 			if _, _, err := b.udpConn.WriteMsgUDPAddrPort(buf, oob, dgEp.dst); err != nil {
