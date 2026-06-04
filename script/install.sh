@@ -375,7 +375,7 @@ EOF
     fi
 
 
-    curl -o /usr/bin/v2node -Ls https://raw.githubusercontent.com/FSWLairport/v2node/main/script/v2node.sh
+    curl -o /usr/bin/v2node -Ls https://raw.githubusercontent.com/FSWLairport/v2node/dev/script/v2node.sh
     chmod +x /usr/bin/v2node
 
     cd $cur_dir
