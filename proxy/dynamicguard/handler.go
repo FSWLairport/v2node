@@ -30,6 +30,7 @@ type Handler struct {
 	cookieMgr    *CookieManager
 	serverWGPriv [32]byte
 	leaseTTL     uint32
+	params       AmneziaParams // per-node AmneziaWG 参数，加密下发给客户端
 
 	pendingCount atomic.Int64
 }
@@ -44,6 +45,7 @@ type HandlerConfig struct {
 	CookieMgr    *CookieManager
 	ServerWGPriv [32]byte
 	LeaseTTL     uint32
+	Params       AmneziaParams
 }
 
 // NewHandler 创建处理器
@@ -57,6 +59,7 @@ func NewHandler(cfg *HandlerConfig) *Handler {
 		cookieMgr:    cfg.CookieMgr,
 		serverWGPriv: cfg.ServerWGPriv,
 		leaseTTL:     cfg.LeaseTTL,
+		params:       cfg.Params,
 	}
 }
 
@@ -326,6 +329,7 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 		AssignedIP:    assignedIP,
 		PrefixLen:     prefixLen,
 		LeaseTTL:      h.leaseTTL,
+		Params:        h.params,
 	}
 
 	// Step 13: 加密并发送 ServerReply

@@ -156,6 +156,22 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 	userKeyMap := NewUserKeyMap()
 	idemCache := NewIdempotencyCache()
 
+	// 生成 per-node AmneziaWG 抗 DPI 参数（进程级唯一，进程生命周期内恒定）。
+	// 同一组参数既用于配置本机 amnezia 设备，又通过 DG01 ServerReply 加密下发
+	// 给客户端，客户端据此配置自己的 amnezia 设备后再发起 WireGuard 握手。
+	// 使用进程级 singleton：amnezia magic header 是包级全局，同进程多个
+	// DGServer 必须共用同一组，否则后启动者会覆盖全局、破坏先启动节点的握手。
+	awgParams, err := SharedAmneziaParams()
+	if err != nil {
+		udpConn.Close()
+		return nil, fmt.Errorf("generate amnezia params: %w", err)
+	}
+	log.WithFields(log.Fields{
+		"jc": awgParams.Jc, "jmin": awgParams.Jmin, "jmax": awgParams.Jmax,
+		"s1": awgParams.S1, "s2": awgParams.S2,
+		"h1": awgParams.H1, "h2": awgParams.H2, "h3": awgParams.H3, "h4": awgParams.H4,
+	}).Debug("[DynamicGuard] generated per-node AmneziaWG params")
+
 	// 创建 WG 设备（使用内核 TUN，自动配置系统路由和 NAT）
 	wgDevice, err := NewWGDevice(&WGDeviceConfig{
 		PrivateKey:  serverWGPriv,
@@ -163,6 +179,7 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		UDPConn:     udpConn,
 		TunnelAddrs: tunnelAddrs,
 		Prefixes:    ipPrefixes,
+		Params:      awgParams,
 	})
 	if err != nil {
 		udpConn.Close()
@@ -182,6 +199,7 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		CookieMgr:    cookieMgr,
 		ServerWGPriv: serverWGPriv,
 		LeaseTTL:     settings.LeaseTTL,
+		Params:       awgParams,
 	})
 
 	// 创建租约管理器
@@ -346,16 +364,16 @@ func (s *DGServer) readLoop() {
 			pktPool.Put(bufPtr)
 			udpAddr := net.UDPAddrFromAddrPort(addrPort)
 			go s.handler.HandleClientInit(dgData, udpAddr, s.udpConn, localAddr)
-		} else if IsWireGuardPacket(data) {
-			// WG 数据（高频热路径）：零拷贝送入 bind，由 recvFn 归还缓冲区
+		} else {
+			// 非 DG01 控制包 = AmneziaWG 数据/握手（首 4 字节为自定义 h1-h4 magic
+			// header，非固定 0x01-04，无法按 type 判定）。统一零拷贝送入 bind，
+			// 由 amnezia device 层识别消息类型并剔除 junk 包；非法包由其内部丢弃。
 			s.wgDevice.GetBind().Deliver(&ReceivedPacket{
 				Data:      data,
 				Addr:      addrPort,
 				LocalAddr: localAddr,
 				buf:       bufPtr,
 			})
-		} else {
-			pktPool.Put(bufPtr)
 		}
 	}
 }

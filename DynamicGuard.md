@@ -206,12 +206,23 @@ reply_key = HKDF-SHA256(
   1   4|16      assigned_ip (4 字节 IPv4 或 16 字节 IPv6，network byte order)
   ?     1       prefix_len
   ?     4       lease_ttl (u32 LE, 秒)
+  ?     4       h1 (u32 LE)   ┐
+  ?     4       h2 (u32 LE)   │ AmneziaWG magic headers（见 §25）
+  ?     4       h3 (u32 LE)   │
+  ?     4       h4 (u32 LE)   ┘
+  ?     2       s1 (u16 LE)   ┐ init/response junk 前缀字节数
+  ?     2       s2 (u16 LE)   ┘
+  ?     2       jc (u16 LE)   ┐
+  ?     2       jmin (u16 LE) │ junk 包数量 / 大小区间
+  ?     2       jmax (u16 LE) ┘
 ```
 
-IPv4 payload：10 字节。IPv6 payload：22 字节。
-加上 auth tag：IPv4 ciphertext 26 字节，IPv6 ciphertext 38 字节。
+基础字段后 append **26 字节** AmneziaWG per-node 参数（h1-h4 各 u32 + s1/s2/jc/jmin/jmax 各 u16，全部小端），供客户端配置数据面 amnezia 设备（见 §25）。
 
-IPv4 总大小：**47 字节**。IPv6 总大小：**59 字节**。
+IPv4 payload：36 字节。IPv6 payload：48 字节。
+加上 auth tag（16 字节）：IPv4 ciphertext 52 字节，IPv6 ciphertext 64 字节。
+
+IPv4 总大小（含 21 字节头部）：**73 字节**。IPv6 总大小：**85 字节**。
 
 ### 7.4 AEAD 构造
 
@@ -610,8 +621,8 @@ FAILED
 |------|------|------|
 | ClientInit（无 cookie） | 167 字节 | 明文 + MAC |
 | ClientInit（有 cookie + PoW） | 207 字节 | 明文 + MAC |
-| ServerReply（IPv4） | 47 字节 | AEAD |
-| ServerReply（IPv6） | 59 字节 | AEAD |
+| ServerReply（IPv4） | 73 字节 | AEAD（含 26B AmneziaWG 参数）|
+| ServerReply（IPv6） | 85 字节 | AEAD（含 26B AmneziaWG 参数）|
 | CookieReply | 39 字节 | 明文 |
 
 完整握手开销（DynamicGuard + WireGuard，IPv4，不含 IP/UDP 头，不含重传）：约 **460 字节**。
@@ -729,65 +740,50 @@ DynamicGuard 在 sing-box 中作为 **endpoint** 类型实现，类型名为 `dy
 
 ---
 
-## 25. WireGuard 混淆层
+## 25. 数据面抗 DPI 混淆层（AmneziaWG）
 
-DynamicGuard 握手完成后承载的是标准 WireGuard 流量。为消除 WireGuard 报文固定的握手大小与首字节指纹，客户端 bind 与服务端 bind 在 UDP 收发路径上对所有 WireGuard 报文施加对称混淆。混淆仅作用于 WireGuard 报文，DG01 控制报文不参与。
+DynamicGuard 握手完成后承载的是 WireGuard 数据面流量。为消除 WireGuard 握手报文固定的首 4 字节 `type` 指纹与固定包长，数据面采用 **AmneziaWG**（WireGuard 的抗 DPI 变体）替代标准 WireGuard。
 
-### 25.1 obfs 密钥
+> **历史**：早期版本在 bind 层对 WireGuard 报文做对称混淆（`type|0x80` 方向位、reserved 字段 HMAC 掩码、尾部 padding、`"SKY"` XOR）。该方案已废弃——它在跨包/跨节点维度是零熵固定指纹，且 mac2 偏移固定可被静态规则识别。现已整体迁移到 AmneziaWG，bind 层退化为纯透传。
 
-混淆使用一个 32 字节固定密钥 `dgObfsKey`，客户端与服务端硬编码且逐字节一致：
+### 25.1 混淆机制
 
-```
-7E 3A 91 F5 0C 68 D4 B2 A1 5F E8 33 9C 47 6D 0A
-52 BD 1E 89 F4 C7 26 38 AF 09 E1 5B 77 2C 80 DF
-```
+AmneziaWG 在 WireGuard 协议层（而非 bind 层）施加三类变换，全部由设备参数驱动：
 
-该密钥独立于 `user_key` 与会话密钥，仅用于 reserved 字段的 HMAC 掩码，不参与任何机密性保证。
+| 参数 | 含义 |
+|------|------|
+| `h1` / `h2` / `h3` / `h4` | 四类消息（Initiation / Response / CookieReply / Transport）的 **magic header**（uint32），替换标准 WireGuard 报文首 4 字节的 `type` 字段 |
+| `s1` / `s2` | 分别 prepend 到 Initiation / Response 握手包前缀的 **junk 字节数** |
+| `jc` / `jmin` / `jmax` | 握手前发送的 **junk 包数量**及每包大小区间 `[jmin, jmax]` |
 
-### 25.2 reserved 元数据编码
+magic header 在协议层写入并**参与 MAC1 计算**，因此必须在握手报文构造时即就位——这是它无法在 bind 层事后替换的根本原因。
 
-WireGuard 报文头部 4 字节为 `type(1) || reserved(3)`，标准 WireGuard 中 reserved 恒为 0。混淆层将 padding 长度与随机熵编码进 reserved 三字节：
+### 25.2 per-node 参数
 
-- `plain24 = padLen | (rand16 << 8)`：`padLen` 占 bit0-7（uint8），`rand16` 占 bit8-23（随机熵）
-- 掩码 `mask = HMAC-SHA256(dgObfsKey, [normType] || body)[0:3]`
-  - `normType` 为去除方向位后的类型（`b0 & 0x7F`）
-  - `body = wgMsg[4:baseLen]`，即 reserved 之后到基础长度之间的报文体
-- 写入 reserved 的三字节为 `plain24` 与 `mask` 按小端逐字节异或
+参数**按节点（per-node）**生成，而非全局硬编码：
 
-掩码仅覆盖报文体 `body`，不覆盖 reserved 自身，因此收发两端可各自确定地重算出同一掩码。
+- 服务端启动时随机生成一组（进程级 `sync.Once` singleton），满足 AmneziaWG `handlePostConfig` 全部约束：
+  - `h1`-`h4` 互异、均 `> 4`、避开 DG01 magic 的小端解读 `0x31304744`（825257796）
+  - `148 + s1 ≠ 92 + s2`（Init / Response 包尺寸必须可区分）
+  - `jmin ≤ jmax`，所有尺寸远小于 MTU
+- 不同节点 / 不同部署拥有不同参数，跨节点不再是恒定指纹——这是抗"校园网计费网关静态签名匹配"威胁模型的核心。
+- 进程级共享（非 per-link）：AmneziaWG 的 magic header 在服务端为包级全局，同进程多个 DGServer 必须共用一组。
 
-各类型基础长度 `baseLen`：
+### 25.3 参数下发
 
-| type | 用途 | baseLen |
-|------|------|---------|
-| 0x01 | Handshake Initiation | 148 |
-| 0x02 | Handshake Response | 92 |
-| 0x03 | Cookie Reply | 64 |
-| 0x04 | Keepalive / Data | 32 |
+客户端通过 **DG01 ServerReply** 获取该节点的参数（见 §7.3，加密载荷尾部追加 26 字节）：
 
-### 25.3 方向标记
+1. 客户端发 ClientInit → 服务端回 ServerReply，其中携带 per-node 参数（h1-h4 / s1 / s2 / jc / jmin / jmax）
+2. 客户端解密 ServerReply，提取参数，配置本地 AmneziaWG 设备（UAPI `IpcSet`：`jc/jmin/jmax/s1/s2/h1/h2/h3/h4`）
+3. 随后发起 WireGuard 握手，此时 magic header 等已就位
 
-出站报文将首字节最高位置 1：`b0 = normType | 0x80`，得到 `0x81`-`0x84`。收端据此识别经混淆的对端报文，在交付 WireGuard 前还原 `normType = b0 & 0x7F` 并清零 reserved 三字节（WireGuard 解析要求 reserved 为 0）。
+DG01 控制报文自身不参与 AmneziaWG 混淆（首 4 字节仍是 `DG01` magic + version）。
 
-### 25.4 Padding 规则
+### 25.4 实现
 
-报文是否追加尾部随机 padding 由类型决定：
+两端均使用 AmneziaWG 的 ASec 实现：
 
-- type 0x01 / 0x02 / 0x03（握手类）：始终追加 padding
-- type 0x04：仅当长度等于 32（keepalive）时追加 padding；长度大于 32 的数据包不追加
-- padding 长度 `padLen ∈ [1, 96]`，由 `crypto/rand` 选取，内容为随机字节，追加在 `baseLen` 之后
+- **服务端**：`github.com/amnezia-vpn/amneziawg-go`，per-node 参数经 `IpcSet` 配置设备
+- **客户端**：`github.com/sagernet/wireguard-go` 的 amnezia-ASec fork（submodule `libcore/third_party/wireguard-go`，`git.sky.wf/airport/wireguard-go`）。在 sagernet fork 上移植了 amnezia 的 magic header / junk 机制，并将 magic 类型与 size→type 映射改为 **per-device**（非包级全局），以支持同进程多个 DG 端点各持不同参数
 
-数据包（type 0x04 且长度大于 32）编码 `padLen = 0` 且不追加 padding，以避免增大 MTU 导致分片；`padLen = 0` 不落在 `[1, 96]` 区间，收端不会误判为可剥离。
-
-收端解码 `padLen`，当且仅当 `padLen ∈ [1, 96]` 且 `n == baseLen + padLen` 时剥离尾部 padding，将报文还原为 `baseLen` 后交付 WireGuard。
-
-### 25.5 anti-DPI junk
-
-客户端在每次建立到服务端的连接后，发送 0..3 个随机长度的垃圾包，以干扰 DPI 的流量时序与包长分布指纹：
-
-- 包数量 `jc ∈ [0, 3]`
-- 每包长度 `∈ [32, 256]`，内容为随机字节
-- 首字节强制落在 demux 范围之外，即避开 `0x44`（DG01 magic 首字节）、`0x01`-`0x04`、`0x81`-`0x84`
-- 包间随机延迟 `∈ [0, 25] ms`
-
-由于 junk 包首字节落在分流范围外，服务端按第 4 节端口复用规则直接丢弃，无需服务端参与，对协议状态无副作用。
+bind 层（客户端 `ClientBind`、服务端 `DGBind`）对 WireGuard 报文**纯透传**，不做任何字节变换；标准（非 DG）WireGuard 端点仍保留原有 reserved 清零行为。
