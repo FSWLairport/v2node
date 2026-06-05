@@ -49,6 +49,10 @@ type ServerReplyPayload struct {
 	AssignedIP    netip.Addr
 	PrefixLen     uint8
 	LeaseTTL      uint32
+	// Params 是 per-node AmneziaWG 抗 DPI 参数，加密下发给客户端；客户端据此
+	// 配置自己的 amnezia 设备后再发起 WireGuard 握手。append-only 追加在载荷
+	// 尾部，不影响既有字段的 wire 偏移。
+	Params AmneziaParams
 }
 
 // IsDynamicGuardPacket 检查报文是否为 DynamicGuard 报文
@@ -56,16 +60,12 @@ func IsDynamicGuardPacket(data []byte) bool {
 	if len(data) < 5 {
 		return false
 	}
+	// 同时校验 version 字节：把随机 junk 包 / amnezia 握手包首 4 字节意外撞
+	// "DG01" 而被误分流到 DG 控制面的概率从 ~1/2^32 收紧到 ~1/2^40。DG01
+	// 协议双端 pin 在 v1，未来升级版本号前此守卫无副作用。
 	return data[0] == dgMagic[0] && data[1] == dgMagic[1] &&
-		data[2] == dgMagic[2] && data[3] == dgMagic[3]
-}
-
-// IsWireGuardPacket 检查报文是否为 WireGuard 报文
-func IsWireGuardPacket(data []byte) bool {
-	if len(data) < 1 {
-		return false
-	}
-	return (data[0] >= 0x01 && data[0] <= 0x04) || (data[0] >= 0x81 && data[0] <= 0x84)
+		data[2] == dgMagic[2] && data[3] == dgMagic[3] &&
+		data[4] == dgVersion
 }
 
 // ParseClientInit 解析 ClientInit 报文
@@ -272,6 +272,10 @@ func computeMAC(userKey [32]byte, clientNonce [16]byte, data []byte) ([32]byte, 
 	return macResult, nil
 }
 
+// replyParamsSize 是追加在 ServerReply 载荷尾部的 AmneziaWG 参数字节数：
+// h1-h4(4×uint32=16) + s1/s2(2×uint16=4) + jc/jmin/jmax(3×uint16=6) = 26。
+const replyParamsSize = 4*4 + 2*2 + 3*2
+
 func encodeReplyPayload(p *ServerReplyPayload) []byte {
 	var addrBytes []byte
 	if p.AddressFamily == 4 {
@@ -281,15 +285,86 @@ func encodeReplyPayload(p *ServerReplyPayload) []byte {
 		addr := p.AssignedIP.As16()
 		addrBytes = addr[:]
 	}
-	// address_family(1) + ip(4|16) + prefix_len(1) + lease_ttl(4)
-	buf := make([]byte, 0, 1+len(addrBytes)+1+4)
+	// address_family(1) + ip(4|16) + prefix_len(1) + lease_ttl(4) + params(26)
+	buf := make([]byte, 0, 1+len(addrBytes)+1+4+replyParamsSize)
 	buf = append(buf, p.AddressFamily)
 	buf = append(buf, addrBytes...)
 	buf = append(buf, p.PrefixLen)
-	ttlBuf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(ttlBuf, p.LeaseTTL)
-	buf = append(buf, ttlBuf...)
+	buf = binary.LittleEndian.AppendUint32(buf, p.LeaseTTL)
+	// AmneziaWG per-node 参数（append-only）。全部小端编码。
+	buf = binary.LittleEndian.AppendUint32(buf, p.Params.H1)
+	buf = binary.LittleEndian.AppendUint32(buf, p.Params.H2)
+	buf = binary.LittleEndian.AppendUint32(buf, p.Params.H3)
+	buf = binary.LittleEndian.AppendUint32(buf, p.Params.H4)
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(p.Params.S1))
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(p.Params.S2))
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(p.Params.Jc))
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(p.Params.Jmin))
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(p.Params.Jmax))
 	return buf
+}
+
+// decodeReplyPayload 解析 ServerReply 明文载荷（与 encodeReplyPayload 互逆）。
+// 服务端自身不调用，供往返测试与客户端解码复用。
+func decodeReplyPayload(data []byte) (*ServerReplyPayload, error) {
+	if len(data) < 1 {
+		return nil, errInvalidPacketSize
+	}
+	p := &ServerReplyPayload{}
+	offset := 0
+	p.AddressFamily = data[offset]
+	offset++
+
+	var ipLen int
+	switch p.AddressFamily {
+	case 4:
+		ipLen = 4
+	case 6:
+		ipLen = 16
+	default:
+		return nil, errInvalidAddressFamily
+	}
+
+	// af(1) + ip(ipLen) + prefix(1) + ttl(4) + params(26)
+	if len(data) < offset+ipLen+1+4+replyParamsSize {
+		return nil, errInvalidPacketSize
+	}
+
+	if p.AddressFamily == 4 {
+		var a [4]byte
+		copy(a[:], data[offset:offset+ipLen])
+		p.AssignedIP = netip.AddrFrom4(a)
+	} else {
+		var a [16]byte
+		copy(a[:], data[offset:offset+ipLen])
+		p.AssignedIP = netip.AddrFrom16(a)
+	}
+	offset += ipLen
+
+	p.PrefixLen = data[offset]
+	offset++
+	p.LeaseTTL = binary.LittleEndian.Uint32(data[offset : offset+4])
+	offset += 4
+
+	p.Params.H1 = binary.LittleEndian.Uint32(data[offset : offset+4])
+	offset += 4
+	p.Params.H2 = binary.LittleEndian.Uint32(data[offset : offset+4])
+	offset += 4
+	p.Params.H3 = binary.LittleEndian.Uint32(data[offset : offset+4])
+	offset += 4
+	p.Params.H4 = binary.LittleEndian.Uint32(data[offset : offset+4])
+	offset += 4
+	p.Params.S1 = int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	p.Params.S2 = int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	p.Params.Jc = int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	p.Params.Jmin = int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	p.Params.Jmax = int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+
+	return p, nil
 }
 
 func checkLeadingZeros(hash []byte, difficulty uint8) bool {

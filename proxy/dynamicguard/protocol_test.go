@@ -247,7 +247,7 @@ func TestParseClientInitRejectsInvalidCookieLen(t *testing.T) {
 	}
 }
 
-// --- IsDynamicGuardPacket / IsWireGuardPacket tests ---
+// --- IsDynamicGuardPacket tests ---
 
 func TestIsDynamicGuardPacket(t *testing.T) {
 	tests := []struct {
@@ -258,36 +258,13 @@ func TestIsDynamicGuardPacket(t *testing.T) {
 		{"valid DG", []byte{0x44, 0x47, 0x30, 0x31, 0x01}, true},
 		{"too short", []byte{0x44, 0x47, 0x30}, false},
 		{"wrong magic", []byte{0x44, 0x47, 0x30, 0x32, 0x01}, false},
+		{"DG magic wrong version", []byte{0x44, 0x47, 0x30, 0x31, 0x99}, false},
 		{"WG packet", []byte{0x01, 0x00, 0x00, 0x00, 0x00}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := IsDynamicGuardPacket(tt.data); got != tt.want {
 				t.Fatalf("IsDynamicGuardPacket(%v) = %v, want %v", tt.data, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestIsWireGuardPacket(t *testing.T) {
-	tests := []struct {
-		name string
-		data []byte
-		want bool
-	}{
-		{"handshake init", []byte{0x01}, true},
-		{"handshake resp", []byte{0x02}, true},
-		{"cookie reply", []byte{0x03}, true},
-		{"data", []byte{0x04}, true},
-		{"zero", []byte{0x00}, false},
-		{"five", []byte{0x05}, false},
-		{"empty", []byte{}, false},
-		{"DG magic", []byte{0x44}, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := IsWireGuardPacket(tt.data); got != tt.want {
-				t.Fatalf("IsWireGuardPacket = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -492,9 +469,158 @@ func TestBuildServerReplyIPv6(t *testing.T) {
 		t.Fatalf("BuildServerReply: %v", err)
 	}
 
-	// IPv6 reply = 21 + 22(payload) + 16(tag) = 59
-	if len(reply) != 59 {
-		t.Fatalf("expected IPv6 reply size 59, got %d", len(reply))
+	// IPv6 reply = 21(header) + payload + 16(tag)
+	// payload = af(1) + ip(16) + prefix(1) + ttl(4) + params(26) = 48
+	// => 21 + 48 + 16 = 85
+	if len(reply) != 85 {
+		t.Fatalf("expected IPv6 reply size 85, got %d", len(reply))
+	}
+}
+
+// --- AmneziaParams round-trip + generation tests ---
+
+// TestServerReplyParamsRoundTrip 验证 per-node 参数经 encode → 加密 → 解密 →
+// decode 后逐字段还原（模拟客户端从 DG01 ServerReply 取参数的完整路径）。
+func TestServerReplyParamsRoundTrip(t *testing.T) {
+	var serverPriv [32]byte
+	for i := range serverPriv {
+		serverPriv[i] = byte(i + 7)
+	}
+	var clientEphPriv [32]byte
+	for i := range clientEphPriv {
+		clientEphPriv[i] = byte(i + 130)
+	}
+	var clientEphPub [32]byte
+	curve25519.ScalarBaseMult(&clientEphPub, &clientEphPriv)
+
+	var userKey [32]byte
+	for i := range userKey {
+		userKey[i] = byte(i + 11)
+	}
+	clientNonce, _ := GenerateNonce()
+	serverNonce, _ := GenerateNonce()
+
+	replyKey, err := DeriveReplyKey(serverPriv, clientEphPub, userKey, clientNonce, serverNonce)
+	if err != nil {
+		t.Fatalf("DeriveReplyKey: %v", err)
+	}
+
+	params := AmneziaParams{
+		Jc: 9, Jmin: 23, Jmax: 211,
+		S1: 76, S2: 129,
+		H1: 0x11223344, H2: 0xAABBCCDD, H3: 0x0A0B0C0D, H4: 0xF0E1D2C3,
+	}
+	payload := &ServerReplyPayload{
+		AddressFamily: 4,
+		AssignedIP:    netip.MustParseAddr("10.7.0.9"),
+		PrefixLen:     24,
+		LeaseTTL:      3600,
+		Params:        params,
+	}
+
+	reply, err := BuildServerReply(serverNonce, replyKey, payload)
+	if err != nil {
+		t.Fatalf("BuildServerReply: %v", err)
+	}
+
+	// 客户端侧解密
+	aead, _ := chacha20poly1305.New(replyKey)
+	nonce := make([]byte, 12)
+	plaintext, err := aead.Open(nil, nonce, reply[21:], reply[:21])
+	if err != nil {
+		t.Fatalf("decrypt ServerReply: %v", err)
+	}
+
+	got, err := decodeReplyPayload(plaintext)
+	if err != nil {
+		t.Fatalf("decodeReplyPayload: %v", err)
+	}
+
+	if got.AddressFamily != 4 || got.AssignedIP != netip.MustParseAddr("10.7.0.9") ||
+		got.PrefixLen != 24 || got.LeaseTTL != 3600 {
+		t.Fatalf("base fields mismatch: %+v", got)
+	}
+	if got.Params != params {
+		t.Fatalf("params mismatch:\n got %+v\nwant %+v", got.Params, params)
+	}
+}
+
+// TestDecodeReplyPayloadRejectsShort 验证截断载荷被拒（防越界）。
+func TestDecodeReplyPayloadRejectsShort(t *testing.T) {
+	full := encodeReplyPayload(&ServerReplyPayload{
+		AddressFamily: 4,
+		AssignedIP:    netip.MustParseAddr("10.0.0.1"),
+		PrefixLen:     24,
+		LeaseTTL:      60,
+		Params:        AmneziaParams{Jc: 1, Jmin: 2, Jmax: 3, S1: 4, S2: 5, H1: 6, H2: 7, H3: 8, H4: 9},
+	})
+	if _, err := decodeReplyPayload(full[:len(full)-1]); err != errInvalidPacketSize {
+		t.Fatalf("expected errInvalidPacketSize for truncated payload, got %v", err)
+	}
+	if _, err := decodeReplyPayload([]byte{0x09}); err != errInvalidAddressFamily {
+		t.Fatalf("expected errInvalidAddressFamily for af=9, got %v", err)
+	}
+}
+
+// TestGenerateAmneziaParamsConstraints 验证生成的参数满足 amneziawg-go
+// handlePostConfig 的全部约束（多次抽样以覆盖随机性）。
+func TestGenerateAmneziaParamsConstraints(t *testing.T) {
+	for i := 0; i < 2000; i++ {
+		p, err := GenerateAmneziaParams()
+		if err != nil {
+			t.Fatalf("GenerateAmneziaParams: %v", err)
+		}
+
+		// H1-H4：均 > 4、四者互异、避开 DG01 魔数
+		hs := []uint32{p.H1, p.H2, p.H3, p.H4}
+		seen := map[uint32]struct{}{}
+		for _, h := range hs {
+			if h <= 4 {
+				t.Fatalf("magic header %d not > 4", h)
+			}
+			if h == dgMagicLEUint32 || h == dgMagicBEUint32 {
+				t.Fatalf("magic header collides with DG01 magic: %d", h)
+			}
+			if _, dup := seen[h]; dup {
+				t.Fatalf("magic headers not distinct: %v", hs)
+			}
+			seen[h] = struct{}{}
+		}
+
+		// s1/s2：148+s1 != 92+s2
+		if wgInitHeaderSize+p.S1 == wgResponseHeaderSize+p.S2 {
+			t.Fatalf("init size %d == response size %d (must differ)",
+				wgInitHeaderSize+p.S1, wgResponseHeaderSize+p.S2)
+		}
+
+		// jmin <= jmax
+		if p.Jmin > p.Jmax {
+			t.Fatalf("jmin %d > jmax %d", p.Jmin, p.Jmax)
+		}
+
+		// 均为正、远小于 MTU 预算
+		if p.Jc <= 0 || p.S1 <= 0 || p.S2 <= 0 || p.Jmin <= 0 {
+			t.Fatalf("non-positive size param: %+v", p)
+		}
+		if wgInitHeaderSize+p.S1 >= 1408 || wgResponseHeaderSize+p.S2 >= 1408 || p.Jmax >= 1408 {
+			t.Fatalf("param exceeds MTU budget: %+v", p)
+		}
+	}
+}
+
+// TestSharedAmneziaParamsStable 验证进程级 singleton：多次调用返回同一组参数
+// （amnezia magic 是包级全局，同进程所有 DGServer 必须共用一组）。
+func TestSharedAmneziaParamsStable(t *testing.T) {
+	p1, err := SharedAmneziaParams()
+	if err != nil {
+		t.Fatalf("SharedAmneziaParams: %v", err)
+	}
+	p2, err := SharedAmneziaParams()
+	if err != nil {
+		t.Fatalf("SharedAmneziaParams (2nd): %v", err)
+	}
+	if p1 != p2 {
+		t.Fatalf("singleton returned differing params:\n p1=%+v\n p2=%+v", p1, p2)
 	}
 }
 
