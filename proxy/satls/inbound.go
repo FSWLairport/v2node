@@ -489,6 +489,9 @@ func (s *Server) handleStream(ctx context.Context, user *protocol.MemoryUser, st
 		_ = writer.Flush()
 		return
 	}
+	if s.tryHandleUoT(ctx, user, stream, reader, writer, dest, dispatcher) {
+		return
+	}
 	destStr := dest.String()
 	userEmail := ""
 	if user != nil {
