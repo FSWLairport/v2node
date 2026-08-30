@@ -70,6 +70,9 @@ func TestGetNodeInfoParsesDashboardSATLSCommonNode(t *testing.T) {
 				if got := r.URL.Query().Get("node_id"); got != "42" {
 					t.Errorf("node_id = %q, want 42", got)
 				}
+				if got := r.Header.Get("X-Node-Version"); got == "" {
+					t.Error("X-Node-Version header was not sent")
+				}
 				if got := r.URL.Query().Get("token"); got != "node-secret" {
 					t.Errorf("token = %q, want node-secret", got)
 				}

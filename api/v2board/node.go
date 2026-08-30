@@ -164,6 +164,7 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 		R().
 		SetContext(ctx).
 		SetHeader("If-None-Match", c.nodeEtag).
+		SetHeader("X-Node-Version", RuntimeNodeVersion()).
 		ForceContentType("application/json").
 		Get(path)
 	if err != nil {
