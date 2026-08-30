@@ -44,6 +44,8 @@ type Server struct {
 	upKeyFile      string
 	downCertFile   string
 	downKeyFile    string
+	upCerts        *certCache
+	downCerts      *certCache
 	rejectUnknown  bool
 
 	wmu            sync.Mutex
@@ -155,6 +157,8 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		MinVersion: tls.VersionTLS12,
 	}
 	s.tlsConfig = tlsConf
+	s.upCerts = newCertCache(s.upCertFile, s.upKeyFile)
+	s.downCerts = newCertCache(s.downCertFile, s.downKeyFile)
 	go s.userUpdaterLoop()
 	return s, nil
 }
@@ -253,17 +257,17 @@ func (s *Server) acceptTLS(raw net.Conn) (net.Conn, string, error) {
 	serverConf.GetConfigForClient = func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
 		clientSNI = ch.ServerName
 		// Select cert based on SNI and link hints
-		if s.upCertFile != "" && s.upKeyFile != "" && sniMatches(ch.ServerName, s.upServerName) {
-			if cert, err := tls.LoadX509KeyPair(s.upCertFile, s.upKeyFile); err == nil {
+		if s.upCerts != nil && sniMatches(ch.ServerName, s.upServerName) {
+			if cert, err := s.upCerts.get(); err == nil {
 				conf := serverConf.Clone()
-				conf.Certificates = []tls.Certificate{cert}
+				conf.Certificates = []tls.Certificate{*cert}
 				return conf, nil
 			}
 		}
-		if s.downCertFile != "" && s.downKeyFile != "" && sniMatches(ch.ServerName, s.downServerName) {
-			if cert, err := tls.LoadX509KeyPair(s.downCertFile, s.downKeyFile); err == nil {
+		if s.downCerts != nil && sniMatches(ch.ServerName, s.downServerName) {
+			if cert, err := s.downCerts.get(); err == nil {
 				conf := serverConf.Clone()
-				conf.Certificates = []tls.Certificate{cert}
+				conf.Certificates = []tls.Certificate{*cert}
 				return conf, nil
 			}
 		}

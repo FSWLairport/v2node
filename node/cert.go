@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -71,23 +72,37 @@ func (c *Controller) requestCert() error {
 		if cert.CertFile == "" || cert.KeyFile == "" {
 			return fmt.Errorf("cert file path or key file path not exist")
 		}
-		if file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile) {
-			return nil
-		}
 		if cert.TlsCert == "" || cert.TlsKey == "" {
 			return fmt.Errorf("tls cert or tls key not exist")
 		}
-		if err := os.WriteFile(cert.CertFile, []byte(cert.TlsCert), 0644); err != nil {
+		// The panel is the only source of truth in remote mode, so the material
+		// is compared rather than merely checked for existence: skipping the
+		// write when the files are already there freezes the first certificate
+		// forever and a rotated one never reaches disk.
+		if err := writeFileIfChanged(cert.CertFile, []byte(cert.TlsCert), 0644); err != nil {
 			return fmt.Errorf("write remote cert error: %s", err)
 		}
-		if err := os.WriteFile(cert.KeyFile, []byte(cert.TlsKey), 0600); err != nil {
+		if err := writeFileIfChanged(cert.KeyFile, []byte(cert.TlsKey), 0600); err != nil {
 			return fmt.Errorf("write remote key error: %s", err)
 		}
-
 	default:
 		return fmt.Errorf("unsupported certmode: %s", cert.CertMode)
 	}
 	return nil
+}
+
+// writeFileIfChanged writes content only when it differs from what is on disk,
+// so a reload that changes nothing does not rewrite the key material.
+func writeFileIfChanged(path string, content []byte, perm os.FileMode) error {
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, content) {
+		return os.Chmod(path, perm)
+	}
+	if err := os.WriteFile(path, content, perm); err != nil {
+		return err
+	}
+	// os.WriteFile only applies perm when it creates the file, so a key left
+	// world-readable by an earlier cert mode would silently keep those bits.
+	return os.Chmod(path, perm)
 }
 
 func generateSelfSslCertificate(domain, certPath, keyPath string) error {
@@ -120,7 +135,7 @@ func generateSelfSslCertificate(domain, certPath, keyPath string) error {
 	if err != nil {
 		return err
 	}
-	f, err = os.OpenFile(keyPath, os.O_CREATE|os.O_RDWR, 0644)
+	f, err = os.OpenFile(keyPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
