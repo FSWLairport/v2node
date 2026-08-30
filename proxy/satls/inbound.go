@@ -520,7 +520,9 @@ func (s *Server) handleStream(ctx context.Context, user *protocol.MemoryUser, st
 	defer stream.Close()
 	reader := &buf.BufferedReader{Reader: buf.NewReader(stream)}
 	writer := buf.NewBufferedWriter(buf.NewWriter(stream))
+	_ = stream.SetReadDeadline(time.Now().Add(streamMetadataTimeout))
 	dest, err := readDestinationMetadata(reader)
+	_ = stream.SetReadDeadline(time.Time{})
 	if err != nil {
 		writer.WriteByte(0xEE)
 		_ = writer.Flush()
@@ -605,8 +607,8 @@ func (s *Server) handleStream(ctx context.Context, user *protocol.MemoryUser, st
 func satlsSmuxConfig() *smux.Config {
 	conf := smux.DefaultConfig()
 	conf.Version = 2
-	conf.KeepAliveInterval = 30 * time.Second
-	conf.KeepAliveTimeout = 90 * time.Second
+	conf.KeepAliveInterval = satlsKeepAliveInterval
+	conf.KeepAliveTimeout = satlsKeepAliveTimeout
 	return conf
 }
 

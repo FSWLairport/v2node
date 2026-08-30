@@ -22,6 +22,22 @@ const (
 	sessionSkewAllowance = 120 * time.Second
 	sessionReplayTTL     = 5 * time.Minute
 	splitDownTimeout     = 10 * time.Second
+
+	// satlsSpecMaxNOPInterval is the slowest heartbeat SATLS.md 7.1 permits a
+	// conforming peer to send.
+	satlsSpecMaxNOPInterval = 30 * time.Second
+	satlsKeepAliveInterval  = satlsSpecMaxNOPInterval
+	// A peer may legitimately go satlsSpecMaxNOPInterval between frames, and
+	// smux judges liveness on a fixed ticker rather than a timer reset by
+	// traffic, so this has to clear that interval by a wide margin or healthy
+	// sessions die on the tick boundary. 45s still halves the time to reclaim a
+	// session behind a black-holed link versus the 90s the spec allows.
+	satlsKeepAliveTimeout = 45 * time.Second
+
+	// streamMetadataTimeout bounds the TLV read that opens a stream. A client
+	// that drops mid-TLV (common on mobile) would otherwise park this stream's
+	// goroutine until the whole smux session times out.
+	streamMetadataTimeout = 10 * time.Second
 )
 
 type linkMode int
