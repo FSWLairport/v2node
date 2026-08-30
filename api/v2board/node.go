@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"encoding/json"
+
+	"github.com/wyx2685/v2node/proxy/dynamicguard"
 )
 
 // Security type
@@ -63,6 +65,22 @@ type CommonNode struct {
 	ObfsPassword            string         `json:"obfs_password"`
 	Ignore_Client_Bandwidth bool           `json:"ignore_client_bandwidth"`
 	SatlsSettings           *SatlsSettings `json:"satls_settings"`
+	//dynamicguard
+	DGSettings *DGNodeSettings `json:"dg_settings,omitempty"`
+}
+
+type DGNodeSettings struct {
+	ServerWGKeyPath   string            `json:"server_wg_key_path"`
+	ServerWGPublicKey string            `json:"server_wg_public_key"`
+	LeaseTTL          uint32            `json:"lease_ttl"`
+	IPPools           map[string]string `json:"ip_pools"`
+	Routes            []string          `json:"routes"`
+	// ACL is the server-enforced egress policy, keyed by network id exactly
+	// like ip_pools. It is never forwarded to clients.
+	ACL           map[string]dynamicguard.DGACL `json:"acl"`
+	CookieEnabled bool                          `json:"cookie_enabled"`
+	PowDifficulty uint8                         `json:"pow_difficulty"`
+	MTU           int                           `json:"mtu"`
 }
 
 type SatlsTLS struct {
@@ -189,6 +207,9 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 		node.Type = cm.Protocol
 		node.Security = cm.Tls
 	case "shadowsocks":
+		node.Type = cm.Protocol
+		node.Security = 0
+	case "dynamicguard":
 		node.Type = cm.Protocol
 		node.Security = 0
 	default:
