@@ -8,12 +8,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	panel "github.com/wyx2685/v2node/api/v2board"
+	"github.com/wyx2685/v2node/proxy/satls"
+	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/infra/conf"
@@ -51,6 +56,7 @@ func (v *V2Core) addInbound(config *core.InboundHandlerConfig) error {
 func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerConfig, error) {
 	in := &coreConf.InboundDetourConfig{}
 	var err error
+	isSatls := false
 	switch nodeInfo.Type {
 	case "vless":
 		err = buildVLess(nodeInfo, in)
@@ -66,6 +72,9 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 		err = buildTuic(nodeInfo, in)
 	case "anytls":
 		err = buildAnyTLS(nodeInfo, in)
+	case "satls":
+		err = buildSATLS(nodeInfo, in)
+		isSatls = true
 	default:
 		return nil, fmt.Errorf("unsupported node type: %s", nodeInfo.Type)
 	}
@@ -130,6 +139,11 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 		if nodeInfo.Common.CertInfo == nil {
 			return nil, errors.New("the CertInfo is not vail")
 		}
+		// SATLS terminates TLS inside proxy/satls. Wrapping the receiver stream
+		// in Xray TLS would require clients to perform two TLS handshakes.
+		if isSatls {
+			break
+		}
 		switch nodeInfo.Common.CertInfo.CertMode {
 		case "none", "":
 			break
@@ -187,6 +201,9 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 		break
 	}
 	in.Tag = tag
+	if isSatls {
+		return buildSATLSInbound(nodeInfo, in)
+	}
 	return in.Build()
 }
 
@@ -530,4 +547,142 @@ func buildAnyTLS(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig
 		return fmt.Errorf("marshal anytls settings error: %s", err)
 	}
 	return nil
+}
+
+func buildSATLS(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig) error {
+	inbound.Protocol = "satls"
+	t := coreConf.TransportProtocol("tcp")
+	inbound.StreamSetting = &coreConf.StreamConfig{Network: &t}
+	empty := json.RawMessage([]byte("{}"))
+	inbound.Settings = (*json.RawMessage)(&empty)
+	return nil
+}
+
+func buildSATLSInbound(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig) (*core.InboundHandlerConfig, error) {
+	receiverSettings := &proxyman.ReceiverConfig{}
+	if inbound.ListenOn == nil {
+		if inbound.PortList == nil {
+			return nil, fmt.Errorf("satls: missing port")
+		}
+		receiverSettings.PortList = inbound.PortList.Build()
+	} else {
+		receiverSettings.Listen = inbound.ListenOn.Build()
+		listenDS := inbound.ListenOn.Family().IsDomain() && (filepath.IsAbs(inbound.ListenOn.Domain()) || inbound.ListenOn.Domain()[0] == '@')
+		listenIP := inbound.ListenOn.Family().IsIP() || (inbound.ListenOn.Family().IsDomain() && inbound.ListenOn.Domain() == "localhost")
+		if listenIP {
+			if inbound.PortList == nil {
+				return nil, fmt.Errorf("satls: missing port for listen IP")
+			}
+			receiverSettings.PortList = inbound.PortList.Build()
+		} else if listenDS {
+			if inbound.PortList != nil {
+				receiverSettings.PortList = nil
+			}
+		} else {
+			return nil, fmt.Errorf("satls: unable to listen on domain %s", inbound.ListenOn.Domain())
+		}
+	}
+	if inbound.StreamSetting != nil {
+		ss, err := inbound.StreamSetting.Build()
+		if err != nil {
+			return nil, err
+		}
+		receiverSettings.StreamSettings = ss
+	}
+	if inbound.SniffingConfig != nil {
+		s, err := inbound.SniffingConfig.Build()
+		if err != nil {
+			return nil, err
+		}
+		receiverSettings.SniffingSettings = s
+	}
+	// SATLS-specific TLS/SNI selection
+	certInfo := nodeInfo.Common.CertInfo
+	if certInfo == nil {
+		return nil, fmt.Errorf("satls: missing cert info")
+	}
+	serverName := nodeInfo.Common.TlsSettings.ServerName
+	if st := nodeInfo.Common.SatlsSettings; st != nil {
+		// st.Host is the HTTP Host used by SATLS clients, not a TLS SNI
+		// allowlist entry, so tls_settings.server_name wins when both are set.
+		// It is still the only server name older panels send, so it remains the
+		// fallback: an empty server name silently disables SNI validation, drops
+		// the fallback target, and makes self-signed generation fail at startup.
+		if serverName == "" {
+			serverName = st.Host
+		}
+		// allow_insecure used to switch off reject_unknown_sni. It is a
+		// client-side certificate verification flag, so it no longer does;
+		// operators who relied on that need to clear reject_unknown_sni.
+		if parseBoolLoose(st.AllowInsecure) && certInfo.RejectUnknownSni {
+			log.WithField("tag", inbound.Tag).
+				Warn("satls: allow_insecure no longer relaxes SNI validation; set reject_unknown_sni=false to accept unknown SNI")
+		}
+	}
+	upServerName := serverName
+	downServerName := serverName
+	if st := nodeInfo.Common.SatlsSettings; st != nil && st.Split != nil {
+		if st.Split.Up != nil {
+			if st.Split.Up.TLS.ServerName != "" {
+				upServerName = st.Split.Up.TLS.ServerName
+			} else if st.Split.Up.Host != "" {
+				upServerName = st.Split.Up.Host
+			}
+		}
+		if st.Split.Down != nil {
+			if st.Split.Down.TLS.ServerName != "" {
+				downServerName = st.Split.Down.TLS.ServerName
+			} else if st.Split.Down.Host != "" {
+				downServerName = st.Split.Down.Host
+			}
+		}
+	}
+	// per-link cert paths (fixed pattern if present)
+	tagID := nodeInfo.Id
+	upCert := fmt.Sprintf("/etc/v2node/satls%d-up.cer", tagID)
+	upKey := fmt.Sprintf("/etc/v2node/satls%d-up.key", tagID)
+	downCert := fmt.Sprintf("/etc/v2node/satls%d-down.cer", tagID)
+	downKey := fmt.Sprintf("/etc/v2node/satls%d-down.key", tagID)
+	return &core.InboundHandlerConfig{
+		Tag:              inbound.Tag,
+		ReceiverSettings: serial.ToTypedMessage(receiverSettings),
+		ProxySettings: serial.ToTypedMessage(&satls.ServerConfig{
+			CertMode:         certInfo.CertMode,
+			CertFile:         certInfo.CertFile,
+			KeyFile:          certInfo.KeyFile,
+			ServerName:       serverName,
+			UpServerName:     upServerName,
+			DownServerName:   downServerName,
+			RejectUnknownSni: certInfo.RejectUnknownSni,
+			UpCertFile:       upCert,
+			UpKeyFile:        upKey,
+			DownCertFile:     downCert,
+			DownKeyFile:      downKey,
+		}),
+	}, nil
+}
+
+// parseBoolLoose accepts the several shapes v2board panels have used for
+// satls_settings.allow_insecure (bool, "1"/"true"/"yes"/"on", numeric).
+func parseBoolLoose(v interface{}) bool {
+	switch val := v.(type) {
+	case nil:
+		return false
+	case bool:
+		return val
+	case string:
+		lower := strings.ToLower(strings.TrimSpace(val))
+		return lower == "true" || lower == "1" || lower == "yes" || lower == "on"
+	case int:
+		return val != 0
+	case int64:
+		return val != 0
+	case float64:
+		return val != 0
+	default:
+		if s, ok := val.(fmt.Stringer); ok {
+			return parseBoolLoose(s.String())
+		}
+		return false
+	}
 }
