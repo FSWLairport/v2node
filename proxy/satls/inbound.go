@@ -44,6 +44,7 @@ type Server struct {
 	upKeyFile      string
 	downCertFile   string
 	downKeyFile    string
+	mainCerts      *certCache
 	upCerts        *certCache
 	downCerts      *certCache
 	rejectUnknown  bool
@@ -145,12 +146,24 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	default:
 		return nil, fmt.Errorf("satls: unsupported certificate mode %q", config.CertMode)
 	}
-	cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
-	if err != nil {
+	s.mainCerts = newCertCache(config.CertFile, config.KeyFile)
+	if s.mainCerts == nil {
+		return nil, stderrs.New("satls: missing certificate path")
+	}
+	// Load once here so a broken or absent keypair fails startup rather than
+	// every handshake.
+	if _, err := s.mainCerts.get(); err != nil {
 		return nil, err
 	}
 	tlsConf := &tls.Config{
-		Certificates: []tls.Certificate{cert},
+		// The keypair is served through the cache instead of being pinned here,
+		// so a certificate rotated on disk - by ACME renewal, by the panel in
+		// remote mode, or by an external tool in file mode - takes effect on the
+		// next handshake instead of waiting for a reload, which tears the whole
+		// node down and drops every live connection.
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return s.mainCerts.get()
+		},
 		// Only HTTP/1.1 - SATLS protocol uses custom HTTP method which requires HTTP/1.x text format.
 		// HTTP/2 uses binary framing that cannot be parsed by http.ReadRequest.
 		NextProtos: []string{"http/1.1"},

@@ -35,9 +35,13 @@ func generateSelfSigned(domain, certPath, keyPath string) error {
 	if err != nil {
 		return err
 	}
+	serial, err := randomSerial()
+	if err != nil {
+		return err
+	}
 	tmpl := &x509.Certificate{
 		Version:      3,
-		SerialNumber: big.NewInt(time.Now().Unix()),
+		SerialNumber: serial,
 		Subject: pkix.Name{
 			CommonName: domain,
 		},
@@ -123,4 +127,15 @@ func statStamp(path string) fileStamp {
 		return fileStamp{}
 	}
 	return fileStamp{modTime: info.ModTime(), size: info.Size()}
+}
+
+// randomSerial draws a certificate serial at random. Deriving it from the
+// current second made two certificates issued in the same second share a
+// serial, which is exactly what a rotation does.
+func randomSerial() (*big.Int, error) {
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("satls: draw certificate serial: %w", err)
+	}
+	return serial, nil
 }

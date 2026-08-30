@@ -1,6 +1,8 @@
 package satls
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"testing"
@@ -84,4 +86,36 @@ func TestCertCacheReportsFirstLoadFailure(t *testing.T) {
 	if _, err := cache.get(); err == nil {
 		t.Fatal("a first load with no files on disk must fail")
 	}
+}
+
+// Two certificates issued back to back must not share a serial. The serial used
+// to be the current Unix second, so a rotation reissued the same one.
+func TestSelfSignedSerialsAreDistinct(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := writeKeypair(t, dir, "up.example.com")
+	first := parseCertificate(t, certPath)
+	if err := generateSelfSigned("up.example.com", certPath, keyPath); err != nil {
+		t.Fatalf("reissue: %v", err)
+	}
+	second := parseCertificate(t, certPath)
+	if first.SerialNumber.Cmp(second.SerialNumber) == 0 {
+		t.Fatalf("both certificates carry serial %s", first.SerialNumber)
+	}
+}
+
+func parseCertificate(t *testing.T, path string) *x509.Certificate {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		t.Fatal("no PEM block in certificate")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("ParseCertificate: %v", err)
+	}
+	return cert
 }

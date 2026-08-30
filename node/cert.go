@@ -106,10 +106,19 @@ func writeFileIfChanged(path string, content []byte, perm os.FileMode) error {
 }
 
 func generateSelfSslCertificate(domain, certPath, keyPath string) error {
-	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+	// Deriving the serial from the current second made two certificates issued
+	// in the same second share a serial, which is exactly what a rotation does.
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return fmt.Errorf("draw certificate serial: %w", err)
+	}
 	tmpl := &x509.Certificate{
 		Version:      3,
-		SerialNumber: big.NewInt(time.Now().Unix()),
+		SerialNumber: serial,
 		Subject: pkix.Name{
 			CommonName: domain,
 		},
