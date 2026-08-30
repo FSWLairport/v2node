@@ -115,7 +115,7 @@ func TestDeviceTableCountByUserOnlyActive(t *testing.T) {
 	}
 }
 
-func TestDeviceTableRemove(t *testing.T) {
+func TestDeviceTableRemoveByID(t *testing.T) {
 	dt := NewDeviceTable()
 	entry := &DeviceEntry{
 		UserID: 1, DeviceID: [16]byte{1}, WGStaticPub: [32]byte{10},
@@ -126,16 +126,22 @@ func TestDeviceTableRemove(t *testing.T) {
 	dt.Register(entry)
 	dt.UnlockDevice(1, entry.DeviceID)
 
-	dt.Remove(entry)
+	removed, ok := dt.RemoveByID(1, entry.DeviceID)
+	if !ok || removed.AssignedIP != entry.AssignedIP {
+		t.Fatalf("RemoveByID returned (%+v, %v)", removed, ok)
+	}
 
 	if dt.Lookup(1, entry.DeviceID) != nil {
-		t.Fatal("Lookup should return nil after Remove")
+		t.Fatal("Lookup should return nil after RemoveByID")
 	}
 	if dt.GetEntryByWGPub(entry.WGStaticPub) != nil {
-		t.Fatal("GetEntryByWGPub should return nil after Remove")
+		t.Fatal("GetEntryByWGPub should return nil after RemoveByID")
 	}
 	if len(dt.GetDevicesByUser(1)) != 0 {
-		t.Fatal("GetDevicesByUser should return empty after Remove")
+		t.Fatal("GetDevicesByUser should return empty after RemoveByID")
+	}
+	if _, ok := dt.RemoveByID(1, entry.DeviceID); ok {
+		t.Fatal("RemoveByID should be idempotent")
 	}
 }
 
@@ -259,5 +265,26 @@ func TestDeviceTableUpdateIP(t *testing.T) {
 	found := dt.GetEntryByWGPub([32]byte{10})
 	if found.AssignedIP != netip.MustParseAddr("10.0.0.99") {
 		t.Fatalf("expected updated IP 10.0.0.99, got %s", found.AssignedIP)
+	}
+}
+
+func TestDeviceTableRemoveByIDIsIdempotent(t *testing.T) {
+	dt := NewDeviceTable()
+	entry := &DeviceEntry{
+		UserID: 7, DeviceID: [16]byte{8}, WGStaticPub: [32]byte{9},
+		AssignedIP: netip.MustParseAddr("10.0.0.8"), Status: DeviceStatusActive,
+	}
+	dt.LockDevice(entry.UserID, entry.DeviceID)
+	if err := dt.Register(entry); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	dt.UnlockDevice(entry.UserID, entry.DeviceID)
+
+	removed, ok := dt.RemoveByID(entry.UserID, entry.DeviceID)
+	if !ok || removed.UserID != entry.UserID || removed.DeviceID != entry.DeviceID {
+		t.Fatalf("RemoveByID = (%+v, %v)", removed, ok)
+	}
+	if removedAgain, ok := dt.RemoveByID(entry.UserID, entry.DeviceID); ok || removedAgain != nil {
+		t.Fatalf("second RemoveByID = (%+v, %v), want (nil, false)", removedAgain, ok)
 	}
 }

@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	log "github.com/sirupsen/logrus"
@@ -58,9 +57,6 @@ func (c *Controller) Start(x *core.V2Core) error {
 	c.userList, err = c.apiClient.GetUserList(context.Background())
 	if err != nil {
 		return fmt.Errorf("get user list error: %s", err)
-	}
-	if len(c.userList) == 0 {
-		return errors.New("add users error: not have any user")
 	}
 	c.aliveMap, err = c.apiClient.GetUserAlive(context.Background())
 	if err != nil {

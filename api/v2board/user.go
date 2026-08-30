@@ -53,11 +53,22 @@ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 	if r.StatusCode() == 304 {
 		return nil, nil
 	}
-	userlist := &UserListBody{}
+	// An empty list is now actionable (it removes every credential on the node),
+	// so an error response must never reach the decoder and be read as "no users".
+	if r.StatusCode() < 200 || r.StatusCode() >= 300 {
+		return nil, fmt.Errorf("get user list: unexpected status %d", r.StatusCode())
+	}
+	// Keep a successful 200 {"users":[]} distinguishable from 304, for which
+	// this method returns a nil slice. The distinction is required to revoke the
+	// final credential on a node.
+	userlist := &UserListBody{Users: make([]UserInfo, 0)}
 	if strings.Contains(r.Header().Get("Content-Type"), "application/x-msgpack") {
 		decoder := msgpack.NewDecoder(r.RawResponse.Body)
 		if err := decoder.Decode(userlist); err != nil {
 			return nil, fmt.Errorf("decode user list error: %w", err)
+		}
+		if userlist.Users == nil {
+			userlist.Users = make([]UserInfo, 0)
 		}
 	} else {
 		dec := jsontext.NewDecoder(r.RawResponse.Body)

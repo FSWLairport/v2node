@@ -151,27 +151,42 @@ func (dt *DeviceTable) CountByUser(userID int) int {
 	return count
 }
 
-// Remove 移除设备
-func (dt *DeviceTable) Remove(entry *DeviceEntry) {
+// RemoveByID removes a device by its stable composite key. It returns an
+// immutable copy of the removed entry so callers can safely release resources
+// after the table lock has been released.
+func (dt *DeviceTable) RemoveByID(userID int, deviceID [16]byte) (*DeviceEntry, bool) {
+	dt.LockDevice(userID, deviceID)
+	defer dt.UnlockDevice(userID, deviceID)
+	return dt.removeByIDLocked(userID, deviceID)
+}
+
+// removeByIDLocked requires the caller to hold the per-device shard lock.
+func (dt *DeviceTable) removeByIDLocked(userID int, deviceID [16]byte) (*DeviceEntry, bool) {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
 
-	key := deviceKey{entry.UserID, entry.DeviceID}
+	key := deviceKey{userID, deviceID}
+	entry, ok := dt.byKey[key]
+	if !ok {
+		return nil, false
+	}
+	snapshot := *entry
 	delete(dt.byKey, key)
 	delete(dt.byWGPub, entry.WGStaticPub)
 	delete(dt.byIP, entry.AssignedIP)
 
 	// 从 byUser 列表中移除
-	userDevices := dt.byUser[entry.UserID]
+	userDevices := dt.byUser[userID]
 	for i, d := range userDevices {
-		if d.DeviceID == entry.DeviceID {
-			dt.byUser[entry.UserID] = append(userDevices[:i], userDevices[i+1:]...)
+		if d.DeviceID == deviceID {
+			dt.byUser[userID] = append(userDevices[:i], userDevices[i+1:]...)
 			break
 		}
 	}
-	if len(dt.byUser[entry.UserID]) == 0 {
-		delete(dt.byUser, entry.UserID)
+	if len(dt.byUser[userID]) == 0 {
+		delete(dt.byUser, userID)
 	}
+	return &snapshot, true
 }
 
 // ExpiredDevice 过期设备信息，携带旧 IP 用于资源释放
@@ -237,7 +252,10 @@ func (dt *DeviceTable) GetDevicesByUser(userID int) []*DeviceEntry {
 	defer dt.mu.RUnlock()
 	src := dt.byUser[userID]
 	result := make([]*DeviceEntry, len(src))
-	copy(result, src)
+	for i, entry := range src {
+		copyOfEntry := *entry
+		result[i] = &copyOfEntry
+	}
 	return result
 }
 
@@ -249,7 +267,8 @@ func (dt *DeviceTable) GetAllActive() []*DeviceEntry {
 	var result []*DeviceEntry
 	for _, entry := range dt.byKey {
 		if entry.Status == DeviceStatusActive {
-			result = append(result, entry)
+			copyOfEntry := *entry
+			result = append(result, &copyOfEntry)
 		}
 	}
 	return result

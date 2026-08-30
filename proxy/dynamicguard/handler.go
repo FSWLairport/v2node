@@ -169,6 +169,14 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 	// Step 9-10: 查设备表 + 分配 IP（原子操作）
 	h.deviceTable.LockDevice(user.UserID, msg.DeviceID)
 	defer h.deviceTable.UnlockDevice(user.UserID, msg.DeviceID)
+	// A credential can be dropped between the first user-key lookup and this
+	// point. Revalidate under the per-device lock so a request that was already
+	// in flight cannot recreate the device after its credential was removed.
+	currentUser := h.userKeyMap.Get(msg.UserKey)
+	if currentUser == nil || currentUser.UserID != user.UserID {
+		return
+	}
+	user = currentUser
 
 	entry := h.deviceTable.Lookup(user.UserID, msg.DeviceID)
 

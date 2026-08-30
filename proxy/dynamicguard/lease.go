@@ -1,6 +1,7 @@
 package dynamicguard
 
 import (
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -13,6 +14,10 @@ type LeaseManager struct {
 	ipPools     map[int]*IPPool
 	leaseTTL    time.Duration
 	stopCh      chan struct{}
+	lifecycleMu sync.Mutex
+	loopDone    sync.WaitGroup
+	started     bool
+	closed      bool
 }
 
 // NewLeaseManager 创建租约管理器
@@ -28,16 +33,32 @@ func NewLeaseManager(dt *DeviceTable, wg *WGDevice, pools map[int]*IPPool, lease
 
 // Start 启动租约清理 goroutine
 func (lm *LeaseManager) Start() {
+	lm.lifecycleMu.Lock()
+	if lm.started || lm.closed {
+		lm.lifecycleMu.Unlock()
+		return
+	}
+	lm.started = true
+	lm.loopDone.Add(1)
+	lm.lifecycleMu.Unlock()
+
 	go lm.cleanupLoop()
 	log.Infof("[DynamicGuard] lease manager started, TTL=%s", lm.leaseTTL)
 }
 
 // Close 停止租约管理器
 func (lm *LeaseManager) Close() {
-	close(lm.stopCh)
+	lm.lifecycleMu.Lock()
+	if !lm.closed {
+		lm.closed = true
+		close(lm.stopCh)
+	}
+	lm.lifecycleMu.Unlock()
+	lm.loopDone.Wait()
 }
 
 func (lm *LeaseManager) cleanupLoop() {
+	defer lm.loopDone.Done()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 

@@ -36,22 +36,28 @@ type DGServerConfig struct {
 	DGSettings *DGSettings
 }
 
+type peerRemover interface {
+	RemovePeer([32]byte) error
+}
+
 // DGServer DynamicGuard 服务端
 type DGServer struct {
-	udpConn      *net.UDPConn
-	wgDevice     *WGDevice
-	handler      *Handler
-	deviceTable  *DeviceTable
-	userKeyMap   *UserKeyMap
-	ipPools      map[int]*IPPool
-	leaseMgr     *LeaseManager
-	idemCache    *IdempotencyCache
-	cookieMgr    *CookieManager
-	serverWGPriv [32]byte
-	leaseTTL     uint32
-	stopCh       chan struct{}
-	readLoopDone sync.WaitGroup
-	closeOnce    sync.Once
+	udpConn       *net.UDPConn
+	wgDevice      *WGDevice
+	peerRemover   peerRemover
+	handler       *Handler
+	deviceTable   *DeviceTable
+	userKeyMap    *UserKeyMap
+	ipPools       map[int]*IPPool
+	leaseMgr      *LeaseManager
+	idemCache     *IdempotencyCache
+	cookieMgr     *CookieManager
+	serverWGPriv  [32]byte
+	leaseTTL      uint32
+	stopCh        chan struct{}
+	readLoopDone  sync.WaitGroup
+	handshakeDone sync.WaitGroup
+	closeOnce     sync.Once
 }
 
 // NewDGServer 创建 DG 服务端
@@ -217,6 +223,7 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 	return &DGServer{
 		udpConn:      udpConn,
 		wgDevice:     wgDevice,
+		peerRemover:  wgDevice,
 		handler:      handler,
 		deviceTable:  deviceTable,
 		userKeyMap:   userKeyMap,
@@ -274,7 +281,7 @@ func (s *DGServer) Start() error {
 
 // UpdateUsers 更新用户列表
 func (s *DGServer) UpdateUsers(users []*UserEntry) {
-	oldCount := len(s.userKeyMap.byID)
+	oldCount := s.userKeyMap.Len()
 	s.userKeyMap.Update(users)
 	log.WithFields(log.Fields{
 		"old_users": oldCount,
@@ -288,29 +295,39 @@ func (s *DGServer) GetUserTraffic() []UserTraffic {
 	return CollectUserTraffic(deltas, s.deviceTable)
 }
 
-// RemoveUser 移除已删除用户的所有设备（WG peer、IP 池）
+// RemoveUser 移除已删除用户的所有设备（WG peer、IP 池）。
+// 用户从面板消失只表示订阅到期或被暂时移除，因此不留墓碑：面板下一次把该用户
+// 发回来时 UpdateUsers 会直接恢复它。
 func (s *DGServer) RemoveUser(userID int) {
+	s.userKeyMap.Remove(userID)
 	devices := s.deviceTable.GetDevicesByUser(userID)
-	if len(devices) > 0 {
-		log.WithFields(log.Fields{
-			"user_id":      userID,
-			"device_count": len(devices),
-		}).Info("[DynamicGuard] removing deleted user devices")
+	if len(devices) == 0 {
+		return
 	}
-	for _, d := range devices {
-		if err := s.wgDevice.RemovePeer(d.WGStaticPub); err != nil {
+	log.WithFields(log.Fields{
+		"user_id":      userID,
+		"device_count": len(devices),
+	}).Info("[DynamicGuard] removing deleted user devices")
+
+	removed := 0
+	for _, device := range devices {
+		// 即使 peer 删除失败也要把条目摘掉：用户已经不在名单里，没有后续重试的
+		// 机会，留着条目只会永久占住 IP 和设备表。
+		if err := s.peerRemover.RemovePeer(device.WGStaticPub); err != nil {
 			log.Warnf("[DynamicGuard] remove peer for deleted user %d: %v", userID, err)
 		}
-		if d.AssignedIP.IsValid() {
-			if pool, ok := s.ipPools[d.GroupID]; ok {
-				pool.Release(d.AssignedIP)
+		entry, ok := s.deviceTable.RemoveByID(userID, device.DeviceID)
+		if !ok {
+			continue
+		}
+		if entry.AssignedIP.IsValid() {
+			if pool, exists := s.ipPools[entry.GroupID]; exists {
+				pool.Release(entry.AssignedIP)
 			}
 		}
-		s.deviceTable.Remove(d)
+		removed++
 	}
-	if len(devices) > 0 {
-		log.Infof("[DynamicGuard] removed %d devices for deleted user %d", len(devices), userID)
-	}
+	log.Infof("[DynamicGuard] removed %d devices for deleted user %d", removed, userID)
 }
 
 // Close 关闭 DG 服务端
@@ -323,7 +340,8 @@ func (s *DGServer) Close() {
 
 		close(s.stopCh)
 		s.udpConn.Close()     // 解除 readLoop 中 ReadFromUDPAddrPort 的阻塞
-		s.readLoopDone.Wait() // 确保 readLoop 退出后再关闭下游子系统
+		s.readLoopDone.Wait() // 确保不会再派生新的握手 goroutine
+		s.handshakeDone.Wait()
 		s.leaseMgr.Close()
 		s.idemCache.Close()
 		s.wgDevice.Close()
@@ -369,7 +387,11 @@ func (s *DGServer) readLoop() {
 			copy(dgData, data)
 			pktPool.Put(bufPtr)
 			udpAddr := net.UDPAddrFromAddrPort(addrPort)
-			go s.handler.HandleClientInit(dgData, udpAddr, s.udpConn, localAddr)
+			s.handshakeDone.Add(1)
+			go func() {
+				defer s.handshakeDone.Done()
+				s.handler.HandleClientInit(dgData, udpAddr, s.udpConn, localAddr)
+			}()
 		} else {
 			// 非 DG01 控制包 = AmneziaWG 数据/握手（首 4 字节为自定义 h1-h4 magic
 			// header，非固定 0x01-04，无法按 type 判定）。统一零拷贝送入 bind，

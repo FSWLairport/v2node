@@ -48,6 +48,28 @@ func (m *UserKeyMap) Update(users []*UserEntry) {
 	m.mu.Unlock()
 }
 
+// Remove disables a credential immediately. It is idempotent so a retried
+// revocation can safely run after the local device entry has already gone.
+func (m *UserKeyMap) Remove(userID int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.byID[userID]
+	if !ok {
+		return false
+	}
+	delete(m.byID, userID)
+	if current, exists := m.entries[entry.UserKey]; exists && current.UserID == userID {
+		delete(m.entries, entry.UserKey)
+	}
+	return true
+}
+
+func (m *UserKeyMap) Len() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.byID)
+}
+
 // UserTraffic 用户流量数据（用于上报面板）
 type UserTraffic struct {
 	UserID   int
