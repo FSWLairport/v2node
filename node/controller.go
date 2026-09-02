@@ -6,6 +6,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	panel "github.com/wyx2685/v2node/api/v2board"
+	"github.com/wyx2685/v2node/common/accesslog"
 	"github.com/wyx2685/v2node/common/task"
 	"github.com/wyx2685/v2node/conf"
 	"github.com/wyx2685/v2node/core"
@@ -93,6 +94,11 @@ func (c *Controller) Start(x *core.V2Core) error {
 	}
 	log.WithField("tag", c.tag).Infof("Added %d new users", added)
 	c.info = node
+	// The dispatcher is shared by every node in this process, so collection is
+	// switched on per inbound tag rather than globally.
+	if c.accessLogEnabled() {
+		accesslog.Enable(c.tag)
+	}
 	c.startTasks(node)
 	return nil
 }
@@ -121,7 +127,8 @@ func (c *Controller) startDynamicGuard(node *panel.NodeInfo) error {
 	}).Info("Starting DynamicGuard node")
 
 	dgServer, err := dynamicguard.NewDGServer(&dynamicguard.DGServerConfig{
-		ListenAddr: listenAddr,
+		ListenAddr:       listenAddr,
+		AccessLogEnabled: c.accessLogEnabled(),
 		DGSettings: &dynamicguard.DGSettings{
 			ServerWGKeyPath:   dgSettings.ServerWGKeyPath,
 			ServerWGPublicKey: dgSettings.ServerWGPublicKey,
@@ -154,6 +161,13 @@ func (c *Controller) startDynamicGuard(node *panel.NodeInfo) error {
 	return nil
 }
 
+// accessLogEnabled reads the panel's per-node switch. It is read at start and
+// on reload only: a configuration change reloads the node anyway, so there is
+// nothing to toggle at runtime.
+func (c *Controller) accessLogEnabled() bool {
+	return c.info != nil && c.info.Common != nil && c.info.Common.BaseConfig != nil && c.info.Common.BaseConfig.AccessLogEnabled
+}
+
 func (c *Controller) updateDGUsers(dgServer *dynamicguard.DGServer) {
 	users := make([]*dynamicguard.UserEntry, 0, len(c.userList))
 	for _, u := range c.userList {
@@ -173,6 +187,7 @@ func (c *Controller) updateDGUsers(dgServer *dynamicguard.DGServer) {
 // Close implement the Close() function of the service interface
 func (c *Controller) Close() error {
 	limiter.DeleteLimiter(c.tag)
+	accesslog.Disable(c.tag)
 	if c.nodeInfoMonitorPeriodic != nil {
 		c.nodeInfoMonitorPeriodic.Close()
 	}

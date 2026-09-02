@@ -156,7 +156,7 @@ func TestACLPolicyAllAllowIsDisabled(t *testing.T) {
 	}
 
 	inner := &fakeTUN{}
-	a := newACLTUN(inner, NewDeviceTable(), nil)
+	a := newACLTUN(inner, NewDeviceTable(), nil, false)
 	// No leases registered either: without a policy nothing is inspected.
 	writeAll(t, a, v4Packet("100.64.0.5", "169.254.169.254"))
 	wantDsts(t, inner, "169.254.169.254")
@@ -175,7 +175,7 @@ func TestACLDefaultAllowWithDenyRules(t *testing.T) {
 			{Action: "deny", CIDR: "10.10.0.0/16"},
 		},
 	}})
-	a := newACLTUN(inner, dt, policy)
+	a := newACLTUN(inner, dt, policy, false)
 
 	writeAll(t, a,
 		v4Packet("100.64.0.5", "169.254.169.254"),
@@ -196,7 +196,7 @@ func TestACLDefaultDenyWithAllowException(t *testing.T) {
 		Default: "deny",
 		Rules:   []DGACLRule{{Action: "allow", CIDR: "192.168.7.0/24"}},
 	}})
-	a := newACLTUN(inner, dt, policy)
+	a := newACLTUN(inner, dt, policy, false)
 
 	writeAll(t, a,
 		v4Packet("100.64.0.9", "192.168.7.20"),
@@ -216,7 +216,7 @@ func TestACLFirstMatchWins(t *testing.T) {
 			{Action: "deny", CIDR: "10.0.0.0/8"}, // shadowed for 10.0.0.0/24
 		},
 	}})
-	a := newACLTUN(inner, dt, policy)
+	a := newACLTUN(inner, dt, policy, false)
 
 	writeAll(t, a,
 		v4Packet("100.64.0.5", "10.0.0.7"),
@@ -235,7 +235,7 @@ func TestACLIPv6(t *testing.T) {
 			{Action: "deny", CIDR: "2001:db8::1/128"},
 		},
 	}})
-	a := newACLTUN(inner, dt, policy)
+	a := newACLTUN(inner, dt, policy, false)
 
 	writeAll(t, a,
 		v6Packet("fd00::5", "fd00:dead::1"),
@@ -249,7 +249,7 @@ func TestACLMalformedPacketsDropped(t *testing.T) {
 	inner := &fakeTUN{}
 	dt := leaseTable(t, map[string]int{"100.64.0.5": 12})
 	policy := newACLPolicy(map[string]DGACL{"12": {Default: "deny"}})
-	a := newACLTUN(inner, dt, policy)
+	a := newACLTUN(inner, dt, policy, false)
 
 	short := make([]byte, testOffset+10)
 	short[testOffset] = 4 << 4
@@ -275,7 +275,7 @@ func TestACLPerNetworkSelection(t *testing.T) {
 		"12": {Default: "allow", Rules: []DGACLRule{{Action: "deny", CIDR: "10.10.0.0/16"}}},
 		"13": {Default: "deny", Rules: []DGACLRule{{Action: "allow", CIDR: "10.10.0.0/16"}}},
 	})
-	a := newACLTUN(inner, dt, policy)
+	a := newACLTUN(inner, dt, policy, false)
 
 	writeAll(t, a,
 		v4Packet("100.64.0.5", "10.10.0.1"), // denied for network 12
@@ -296,7 +296,7 @@ func TestACLNetworkWithoutConfigIsUnfiltered(t *testing.T) {
 	policy := newACLPolicy(map[string]DGACL{
 		"12": {Default: "deny"},
 	})
-	a := newACLTUN(inner, dt, policy)
+	a := newACLTUN(inner, dt, policy, false)
 
 	writeAll(t, a,
 		v4Packet("100.64.0.5", "8.8.8.8"),
@@ -317,7 +317,7 @@ func TestACLUnknownValuesDeny(t *testing.T) {
 	if policy == nil {
 		t.Fatal("unknown default must not compile to no policy")
 	}
-	a := newACLTUN(inner, dt, policy)
+	a := newACLTUN(inner, dt, policy, false)
 
 	writeAll(t, a,
 		v4Packet("100.64.0.5", "8.8.8.8"),
@@ -333,7 +333,7 @@ func TestACLPolicySwapTakesEffect(t *testing.T) {
 	dt := leaseTable(t, map[string]int{"100.64.0.5": 12})
 	a := newACLTUN(inner, dt, newACLPolicy(map[string]DGACL{
 		"12": {Default: "allow", Rules: []DGACLRule{{Action: "deny", CIDR: "10.0.0.0/8"}}},
-	}))
+	}), false)
 
 	writeAll(t, a, v4Packet("100.64.0.5", "10.0.0.1"))
 	if len(inner.written) != 0 {
@@ -359,7 +359,7 @@ func TestACLAllAllowedSkipsCopy(t *testing.T) {
 	dt := leaseTable(t, map[string]int{"100.64.0.5": 12})
 	a := newACLTUN(inner, dt, newACLPolicy(map[string]DGACL{
 		"12": {Default: "allow", Rules: []DGACLRule{{Action: "deny", CIDR: "10.0.0.0/8"}}},
-	}))
+	}), false)
 
 	bufs := [][]byte{v4Packet("100.64.0.5", "1.1.1.1"), v4Packet("100.64.0.5", "2.2.2.2")}
 	allocs := testing.AllocsPerRun(100, func() {

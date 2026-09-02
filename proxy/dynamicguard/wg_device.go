@@ -188,8 +188,10 @@ func (b *DGBind) BatchSize() int { return 1 }
 
 // WGDevice 封装 wireguard-go 设备（使用内核 TUN）
 type WGDevice struct {
-	device      *device.Device
-	bind        *DGBind
+	device *device.Device
+	bind   *DGBind
+	// aclDev 是包裹内核 TUN 的那一层，访问日志的流表挂在它上面。
+	aclDev      *aclTUN
 	tunName     string
 	privateKey  [32]byte
 	deviceTable *DeviceTable
@@ -212,6 +214,8 @@ type WGDeviceConfig struct {
 	Params      AmneziaParams  // per-node AmneziaWG 抗 DPI 参数（与下发给客户端的同一组）
 	DeviceTable *DeviceTable   // 按包的源隧道 IP 定位所属网络（ACL 强制用）
 	ACL         *aclPolicy     // 服务端强制的出网策略，nil 表示不过滤
+	// AccessLogEnabled 打开逐连接记录。关闭时数据面只多一次原子读。
+	AccessLogEnabled bool
 }
 
 // NewWGDevice 创建 WireGuard 用户态设备（使用内核 TUN 接口）
@@ -245,7 +249,7 @@ func NewWGDevice(cfg *WGDeviceConfig) (*WGDevice, error) {
 	}
 
 	// 包一层 ACL 过滤：从 peer 解封装后写入内核的方向是客户端出网的必经之路
-	aclDev := newACLTUN(tunDev, cfg.DeviceTable, cfg.ACL)
+	aclDev := newACLTUN(tunDev, cfg.DeviceTable, cfg.ACL, cfg.AccessLogEnabled)
 
 	// 创建 wireguard-go 设备
 	dev := device.NewDevice(aclDev, bind, wgLogger)
@@ -274,11 +278,20 @@ func NewWGDevice(cfg *WGDeviceConfig) (*WGDevice, error) {
 	return &WGDevice{
 		device:      dev,
 		bind:        bind,
+		aclDev:      aclDev,
 		tunName:     tunName,
 		privateKey:  cfg.PrivateKey,
 		deviceTable: nil, // 在 server 初始化后通过 SetDeviceTable 注入
 		lastStats:   make(map[[32]byte]peerTraffic),
 	}, nil
+}
+
+// DrainFlowRecords 取走自上次以来观察到的连接记录。上报任务是它唯一的消费者。
+func (w *WGDevice) DrainFlowRecords() []FlowRecord {
+	if w.aclDev == nil {
+		return nil
+	}
+	return w.aclDev.flows.drain(time.Now())
 }
 
 // SetDeviceTable 注入设备表引用（在 server 初始化完成后调用）

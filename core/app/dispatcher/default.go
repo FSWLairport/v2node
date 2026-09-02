@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wyx2685/v2node/common/accesslog"
 	"github.com/wyx2685/v2node/common/counter"
 	"github.com/wyx2685/v2node/common/rate"
 	"github.com/wyx2685/v2node/limiter"
@@ -572,7 +573,42 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			}
 		}
 		log.Record(accessMessage)
+		// The panel's access log is recorded here rather than through
+		// log.RegisterHandler because xray keeps a single global handler:
+		// installing one would replace the operator's own access log. This runs
+		// once per connection, after sniffing, so the destination is already the
+		// resolved name when there is one.
+		if accesslog.Enabled(inTag) {
+			accesslog.Push(inTag, panelAccessRecord(ctx, ob, destination, accessMessage.Email))
+		}
 	}
 
 	handler.Dispatch(ctx, link)
+}
+
+// panelAccessRecord flattens what the dispatcher knows about one connection.
+// Sniffing rewrites the destination address to a domain when it resolves one,
+// so the pre-sniff address is read back from the outbound's original target.
+func panelAccessRecord(ctx context.Context, ob *session.Outbound, destination net.Destination, email string) accesslog.Record {
+	record := accesslog.Record{
+		Email:     email,
+		At:        time.Now(),
+		Transport: strings.ToLower(destination.Network.String()),
+		DstPort:   int(destination.Port),
+	}
+	if destination.Address != nil {
+		if destination.Address.Family().IsDomain() {
+			record.Domain = destination.Address.Domain()
+		} else {
+			record.DstIP = destination.Address.IP().String()
+		}
+	}
+	if record.DstIP == "" && ob != nil && ob.OriginalTarget.Address != nil && !ob.OriginalTarget.Address.Family().IsDomain() {
+		record.DstIP = ob.OriginalTarget.Address.IP().String()
+	}
+	if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.Address != nil && !inbound.Source.Address.Family().IsDomain() {
+		record.SrcIP = inbound.Source.Address.IP().String()
+		record.SrcPort = int(inbound.Source.Port)
+	}
+	return record
 }

@@ -107,6 +107,15 @@ func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserT
 	return nil, nil
 }
 
+// UIDByEmail resolves the user tag an inbound authenticated ("tag|uuid") to the
+// panel's credential id. It reports 0 for a user that has since been removed,
+// which is what a caller drops rather than reports.
+func (v *V2Core) UIDByEmail(email string) int {
+	v.users.mapLock.RLock()
+	defer v.users.mapLock.RUnlock()
+	return v.users.uidMap[email]
+}
+
 func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
 	v.users.mapLock.Lock()
 	defer v.users.mapLock.Unlock()

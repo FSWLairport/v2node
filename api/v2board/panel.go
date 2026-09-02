@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -24,6 +25,10 @@ type Client struct {
 	responseBodyHash string
 	UserList         *UserListBody
 	AliveMap         *AliveMap
+	// unsupported remembers the additive report endpoints this panel answered
+	// 404 for, so the node stops posting reports a v2board-style panel has no
+	// route for.
+	unsupported sync.Map
 }
 
 func New(c *conf.NodeConfig) (*Client, error) {

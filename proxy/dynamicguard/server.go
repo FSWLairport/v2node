@@ -34,6 +34,9 @@ type DGSettings struct {
 type DGServerConfig struct {
 	ListenAddr string
 	DGSettings *DGSettings
+	// AccessLogEnabled comes from base_config, not from dg_settings: the panel
+	// offers the same switch for both protocols.
+	AccessLogEnabled bool
 }
 
 type peerRemover interface {
@@ -192,6 +195,8 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		Params:      awgParams,
 		DeviceTable: deviceTable,
 		ACL:         newACLPolicy(settings.ACL),
+
+		AccessLogEnabled: cfg.AccessLogEnabled,
 	})
 	if err != nil {
 		udpConn.Close()
@@ -287,6 +292,16 @@ func (s *DGServer) UpdateUsers(users []*UserEntry) {
 		"old_users": oldCount,
 		"new_users": len(users),
 	}).Debug("[DynamicGuard] updated users")
+}
+
+// ActiveDevices 返回当前活跃设备的快照副本，即这个节点正在出租的地址。
+func (s *DGServer) ActiveDevices() []*DeviceEntry {
+	return s.deviceTable.GetAllActive()
+}
+
+// DrainFlowRecords 取走自上次以来观察到的连接记录。
+func (s *DGServer) DrainFlowRecords() []FlowRecord {
+	return s.wgDevice.DrainFlowRecords()
 }
 
 // GetUserTraffic 通过 WG IPC 采集 peer 流量并按用户聚合

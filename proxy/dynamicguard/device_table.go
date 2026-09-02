@@ -232,6 +232,19 @@ func (dt *DeviceTable) GroupIDByIP(ip netip.Addr) (int, bool) {
 	return entry.GroupID, true
 }
 
+// OwnerByIP resolves a tunnel address to the credential and device holding it.
+// It returns values rather than the entry so a caller on the packet path cannot
+// retain a pointer into the table, the same reason GetDevicesByUser copies.
+func (dt *DeviceTable) OwnerByIP(ip netip.Addr) (userID int, deviceID [16]byte, ok bool) {
+	dt.mu.RLock()
+	defer dt.mu.RUnlock()
+	entry, ok := dt.byIP[ip]
+	if !ok {
+		return 0, deviceID, false
+	}
+	return entry.UserID, entry.DeviceID, true
+}
+
 // UpdateIP 更新设备的 IP 索引（disconnected 重连后重新分配 IP 时调用）
 func (dt *DeviceTable) UpdateIP(entry *DeviceEntry) {
 	dt.mu.Lock()

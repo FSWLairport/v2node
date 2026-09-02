@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 
+	"github.com/sirupsen/logrus"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
@@ -168,5 +170,87 @@ func (c *Client) ReportNodeOnlineUsers(ctx context.Context, data *map[int][]stri
 		return err
 	}
 
+	return nil
+}
+
+// DGLease is one address a DynamicGuard node currently leases from its pool.
+// UID is the panel's credential id, the same value the user list calls an id.
+type DGLease struct {
+	UID        int    `json:"uid"`
+	DeviceID   string `json:"device_id"`
+	IP         string `json:"ip"`
+	LastSeenAt string `json:"last_seen_at"`
+}
+
+// ReportDGLeases sends the node's whole device table. An empty snapshot is sent
+// too: it is how the node says it leases nothing any more, and skipping it would
+// leave the panel showing addresses that were released.
+func (c *Client) ReportDGLeases(ctx context.Context, leases []DGLease) error {
+	if leases == nil {
+		leases = []DGLease{}
+	}
+	return c.postReport(ctx, leasesPath, map[string]any{"leases": leases})
+}
+
+// AccessLogEntry is one connection this node carried. A DynamicGuard node fills
+// the five-tuple; a SATLS node fills what its sniffer resolved, so Domain may be
+// the only destination it knows.
+type AccessLogEntry struct {
+	UID       int    `json:"uid"`
+	Ts        string `json:"ts"`
+	Protocol  string `json:"protocol"`
+	Transport string `json:"transport,omitempty"`
+	SrcIP     string `json:"src_ip,omitempty"`
+	SrcPort   int    `json:"src_port,omitempty"`
+	DstIP     string `json:"dst_ip,omitempty"`
+	DstPort   int    `json:"dst_port,omitempty"`
+	Domain    string `json:"domain,omitempty"`
+	DeviceID  string `json:"device_id,omitempty"`
+}
+
+// AccessLogBatchSize bounds one request. The caller chunks rather than the
+// panel refusing an oversized body.
+const AccessLogBatchSize = 1000
+
+// ReportAccessLogs posts one batch.
+func (c *Client) ReportAccessLogs(ctx context.Context, logs []AccessLogEntry) error {
+	if len(logs) == 0 {
+		return nil
+	}
+	return c.postReport(ctx, logsPath, map[string]any{"logs": logs})
+}
+
+const (
+	leasesPath = "/api/v1/server/UniProxy/leases"
+	logsPath   = "/api/v1/server/UniProxy/logs"
+)
+
+// postReport sends one additive report. These two endpoints are not part of the
+// five every v2board-style panel implements, so a panel that does not know them
+// answers 404 — and a DynamicGuard node would otherwise keep posting a lease
+// snapshot at it on every push, forever. The first 404 latches the endpoint off
+// for this client, which lives until the next reload; a panel that gains the
+// endpoint is a configuration change, and that reloads the node anyway.
+//
+// Any other status is ignored exactly like the traffic and alive reports ignore
+// theirs: these are observations, and losing one must never stall the push task
+// carrying the counters that bill.
+func (c *Client) postReport(ctx context.Context, path string, body any) error {
+	if _, unsupported := c.unsupported.Load(path); unsupported {
+		return nil
+	}
+	r, err := c.client.R().
+		SetContext(ctx).
+		SetBody(body).
+		ForceContentType("application/json").
+		Post(path)
+	if err != nil {
+		return err
+	}
+	if r != nil && r.StatusCode() == http.StatusNotFound {
+		c.unsupported.Store(path, struct{}{})
+		logrus.WithFields(logrus.Fields{"path": path, "host": c.APIHost}).
+			Info("panel does not implement this report; skipping it until the next reload")
+	}
 	return nil
 }

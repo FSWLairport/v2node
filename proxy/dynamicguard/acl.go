@@ -123,14 +123,17 @@ type aclTUN struct {
 	tun.Device
 	devices *DeviceTable
 	policy  atomic.Pointer[aclPolicy]
+	// flows observes what this device forwards. It shares the Write path with
+	// the ACL because that is the only place a decapsulated packet exists.
+	flows   *flowLog
 	dropped atomic.Uint64
 	lastLog atomic.Int64 // unix nano of the last drop log, rate limits the hot path
 }
 
 const aclDropLogInterval = 30 * time.Second
 
-func newACLTUN(inner tun.Device, devices *DeviceTable, policy *aclPolicy) *aclTUN {
-	a := &aclTUN{Device: inner, devices: devices}
+func newACLTUN(inner tun.Device, devices *DeviceTable, policy *aclPolicy, accessLog bool) *aclTUN {
+	a := &aclTUN{Device: inner, devices: devices, flows: newFlowLog(accessLog)}
 	a.SetPolicy(policy)
 	return a
 }
@@ -143,7 +146,8 @@ func (a *aclTUN) Dropped() uint64 { return a.dropped.Load() }
 
 func (a *aclTUN) Write(bufs [][]byte, offset int) (int, error) {
 	policy := a.policy.Load()
-	if policy == nil {
+	logging := a.flows.enabled.Load()
+	if policy == nil && !logging {
 		return a.Device.Write(bufs, offset)
 	}
 
@@ -151,8 +155,18 @@ func (a *aclTUN) Write(bufs [][]byte, offset int) (int, error) {
 	// keeps this path allocation free.
 	var filtered [][]byte
 	drops := 0
+	var now time.Time
+	if logging {
+		now = time.Now()
+	}
 	for i, buf := range bufs {
-		if a.permit(policy, buf, offset) {
+		if policy == nil || a.permit(policy, buf, offset) {
+			// Only forwarded packets are recorded: a denied one never reached
+			// anything, and logging it would describe a connection that did not
+			// happen.
+			if logging && offset <= len(buf) {
+				a.flows.observe(buf[offset:], a.devices, now)
+			}
 			if filtered != nil {
 				filtered = append(filtered, buf)
 			}
