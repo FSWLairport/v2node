@@ -48,10 +48,19 @@ func TestPacketPortsReadsTransportHeaders(t *testing.T) {
 		t.Fatalf("fragment proto=%d src=%d dst=%d", proto, srcPort, dstPort)
 	}
 
-	// ICMP and anything else record as a flow without ports rather than not at
-	// all, which is what keeps a ping flood down to one record per TTL.
+	// ICMP keeps its number and reports no ports, so the panel can tell a ping
+	// from an ESP tunnel instead of filing both as "other". The bytes where the
+	// ports would be must not be read as ports.
+	for _, other := range []uint8{1, 50, 47} {
+		if proto, srcPort, dstPort = packetPorts(tcpPacket("10.0.0.2", "1.1.1.1", 51544, 443, other)[testOffset:]); proto != other || srcPort != 0 || dstPort != 0 {
+			t.Fatalf("proto %d read as proto=%d src=%d dst=%d", other, proto, srcPort, dstPort)
+		}
+	}
+
+	// A header this short is unreadable rather than a protocol: v4Packet leaves
+	// the header length at zero.
 	if proto, srcPort, dstPort = packetPorts(v4Packet("10.0.0.2", "1.1.1.1")[testOffset:]); proto != 0 || srcPort != 0 || dstPort != 0 {
-		t.Fatalf("icmp proto=%d src=%d dst=%d", proto, srcPort, dstPort)
+		t.Fatalf("unreadable header proto=%d src=%d dst=%d", proto, srcPort, dstPort)
 	}
 }
 
@@ -70,7 +79,7 @@ func TestFlowLogRecordsEachFlowOncePerTTL(t *testing.T) {
 	if len(records) != 2 {
 		t.Fatalf("records=%d, want 2", len(records))
 	}
-	if records[0].UserID == 0 || records[0].DstPort != 443 || records[0].Transport() != "tcp" {
+	if records[0].UserID == 0 || records[0].DstPort != 443 || records[0].Proto != 6 {
 		t.Fatalf("record=%#v", records[0])
 	}
 
@@ -79,6 +88,32 @@ func TestFlowLogRecordsEachFlowOncePerTTL(t *testing.T) {
 	flows.observe(packet, devices, at.Add(flowTTL+time.Minute))
 	if again := flows.drain(at.Add(flowTTL + 2*time.Minute)); len(again) != 1 {
 		t.Fatalf("after TTL records=%d, want 1", len(again))
+	}
+}
+
+// ICMP has no ports, so the protocol number is the only thing that separates a
+// ping from the TCP session to the same address. A flood still costs one record
+// per TTL rather than one per packet.
+func TestFlowLogRecordsICMPAsItsOwnFlow(t *testing.T) {
+	devices := leaseTable(t, map[string]int{"10.0.0.2": 7})
+	flows := newFlowLog(true)
+	at := time.Now()
+	icmp := tcpPacket("10.0.0.2", "1.1.1.1", 51544, 443, 1)[testOffset:]
+
+	// ICMP carries no ports, so every packet of a flood hashes to the same key
+	// and the whole flood is one record: a ping is a flow, not a per-packet
+	// event, and the panel must never be asked to store it as one.
+	for i := range 1000 {
+		flows.observe(icmp, devices, at.Add(time.Duration(i)*time.Millisecond))
+	}
+	flows.observe(tcpPacket("10.0.0.2", "1.1.1.1", 51544, 443, 6)[testOffset:], devices, at.Add(time.Second))
+
+	records := flows.drain(at.Add(2 * time.Second))
+	if len(records) != 2 {
+		t.Fatalf("records=%d, want 2 (one ICMP flow, one TCP flow)", len(records))
+	}
+	if records[0].Proto != 1 || records[0].SrcPort != 0 || records[0].DstPort != 0 {
+		t.Fatalf("icmp record=%#v", records[0])
 	}
 }
 

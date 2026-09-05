@@ -589,12 +589,25 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 // panelAccessRecord flattens what the dispatcher knows about one connection.
 // Sniffing rewrites the destination address to a domain when it resolves one,
 // so the pre-sniff address is read back from the outbound's original target.
+// ipProtoOf maps the dispatcher's transport to its IANA number. A connection
+// level inbound only ever carries TCP or UDP; Unknown and UNIX have no protocol
+// number to report and the panel reads 0 as "the node did not know".
+func ipProtoOf(network net.Network) int {
+	switch network {
+	case net.Network_TCP:
+		return 6
+	case net.Network_UDP:
+		return 17
+	}
+	return 0
+}
+
 func panelAccessRecord(ctx context.Context, ob *session.Outbound, destination net.Destination, email string) accesslog.Record {
 	record := accesslog.Record{
-		Email:     email,
-		At:        time.Now(),
-		Transport: strings.ToLower(destination.Network.String()),
-		DstPort:   int(destination.Port),
+		Email:   email,
+		At:      time.Now(),
+		IPProto: ipProtoOf(destination.Network),
+		DstPort: int(destination.Port),
 	}
 	if destination.Address != nil {
 		if destination.Address.Family().IsDomain() {

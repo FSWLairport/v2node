@@ -147,15 +147,15 @@ func (c *Controller) reportDGAccessLogs(ctx context.Context) {
 	entries := make([]panel.AccessLogEntry, 0, len(records))
 	for _, record := range records {
 		entries = append(entries, panel.AccessLogEntry{
-			UID:       record.UserID,
-			Ts:        record.At.UTC().Format(time.RFC3339),
-			Protocol:  "dg",
-			Transport: record.Transport(),
-			SrcIP:     record.Src.String(),
-			SrcPort:   int(record.SrcPort),
-			DstIP:     record.Dst.String(),
-			DstPort:   int(record.DstPort),
-			DeviceID:  hex.EncodeToString(record.DeviceID[:]),
+			UID:      record.UserID,
+			Ts:       record.At.UTC().Format(time.RFC3339),
+			Protocol: "dg",
+			IPProto:  int(record.Proto),
+			SrcIP:    record.Src.String(),
+			SrcPort:  int(record.SrcPort),
+			DstIP:    record.Dst.String(),
+			DstPort:  int(record.DstPort),
+			DeviceID: hex.EncodeToString(record.DeviceID[:]),
 		})
 	}
 	c.postAccessLogs(ctx, entries)
@@ -178,15 +178,15 @@ func (c *Controller) reportXrayAccessLogs(ctx context.Context) {
 			continue
 		}
 		entries = append(entries, panel.AccessLogEntry{
-			UID:       uid,
-			Ts:        record.At.UTC().Format(time.RFC3339),
-			Protocol:  "satls",
-			Transport: record.Transport,
-			SrcIP:     record.SrcIP,
-			SrcPort:   record.SrcPort,
-			DstIP:     record.DstIP,
-			DstPort:   record.DstPort,
-			Domain:    record.Domain,
+			UID:      uid,
+			Ts:       record.At.UTC().Format(time.RFC3339),
+			Protocol: "satls",
+			IPProto:  record.IPProto,
+			SrcIP:    record.SrcIP,
+			SrcPort:  record.SrcPort,
+			DstIP:    record.DstIP,
+			DstPort:  record.DstPort,
+			Domain:   record.Domain,
 		})
 	}
 	c.postAccessLogs(ctx, entries)

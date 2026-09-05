@@ -65,7 +65,7 @@ func TestReportDGLeasesSendsSnapshotsIncludingEmptyOnes(t *testing.T) {
 func TestReportAccessLogsCarriesTheRecordShape(t *testing.T) {
 	body := captureReport(t, "/api/v1/server/UniProxy/logs", http.StatusOK, func(c *Client) error {
 		return c.ReportAccessLogs(context.Background(), []AccessLogEntry{
-			{UID: 7, Ts: "2026-09-01T10:00:00Z", Protocol: "satls", Transport: "tcp", SrcIP: "198.51.100.4", SrcPort: 40001, DstPort: 443, Domain: "www.example.test"},
+			{UID: 7, Ts: "2026-09-01T10:00:00Z", Protocol: "satls", IPProto: 6, SrcIP: "198.51.100.4", SrcPort: 40001, DstPort: 443, Domain: "www.example.test"},
 		})
 	})
 	logs, ok := body["logs"].([]any)

@@ -141,10 +141,11 @@ func (f *flowLog) noteDropped(n int, now time.Time) {
 	log.WithField("dropped_total", total).Info("[DynamicGuard] access log records dropped")
 }
 
-// packetPorts reads the transport header of an IPv4 or IPv6 packet. Anything it
-// cannot read as TCP or UDP reports protocol 0 with no ports, which still
-// records the flow — an ICMP flood then costs one record per TTL instead of
-// being invisible.
+// packetPorts reads the IP protocol number and, for TCP and UDP, the ports.
+// Every other protocol keeps its number and reports no ports: ICMP, and the
+// encapsulations an audit cares about most because the log goes blind inside
+// them (ESP, AH, GRE), are then distinguishable rather than all "other".
+// Protocol 0 means the header could not be read at all.
 func packetPorts(pkt []byte) (proto uint8, srcPort, dstPort uint16) {
 	if len(pkt) < 1 {
 		return 0, 0, 0
@@ -169,29 +170,16 @@ func packetPorts(pkt []byte) (proto uint8, srcPort, dstPort uint16) {
 		if len(pkt) < 40 {
 			return 0, 0, 0
 		}
-		// ponytail: no extension-header walk. A chained header reports as
-		// "other", which is a coarser record rather than a wrong one.
+		// ponytail: no extension-header walk, so a chained packet reports the
+		// first next-header value (0 for hop-by-hop, 43 for routing) instead of
+		// the protocol behind it. Walk the chain if these show up in the log
+		// often enough to mislead.
 		proto, offset = pkt[6], 40
 	default:
 		return 0, 0, 0
 	}
-	if proto != 6 && proto != 17 {
-		return 0, 0, 0
-	}
-	if len(pkt) < offset+4 {
+	if (proto != 6 && proto != 17) || len(pkt) < offset+4 {
 		return proto, 0, 0
 	}
 	return proto, binary.BigEndian.Uint16(pkt[offset:]), binary.BigEndian.Uint16(pkt[offset+2:])
-}
-
-// Transport names the protocol the way the panel's wire contract does.
-func (r FlowRecord) Transport() string {
-	switch r.Proto {
-	case 6:
-		return "tcp"
-	case 17:
-		return "udp"
-	default:
-		return "other"
-	}
 }

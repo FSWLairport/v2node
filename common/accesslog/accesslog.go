@@ -26,14 +26,14 @@ const dropLogPeriod = 30 * time.Second
 // inbound authenticated ("tag|uuid"); the caller resolves it to a credential id
 // when it drains, because only the core owns that mapping.
 type Record struct {
-	Email     string
-	At        time.Time
-	Transport string
-	SrcIP     string
-	SrcPort   int
-	DstIP     string
-	DstPort   int
-	Domain    string
+	Email   string
+	At      time.Time
+	IPProto int
+	SrcIP   string
+	SrcPort int
+	DstIP   string
+	DstPort int
+	Domain  string
 }
 
 var (

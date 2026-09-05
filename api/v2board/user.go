@@ -196,16 +196,16 @@ func (c *Client) ReportDGLeases(ctx context.Context, leases []DGLease) error {
 // the five-tuple; a SATLS node fills what its sniffer resolved, so Domain may be
 // the only destination it knows.
 type AccessLogEntry struct {
-	UID       int    `json:"uid"`
-	Ts        string `json:"ts"`
-	Protocol  string `json:"protocol"`
-	Transport string `json:"transport,omitempty"`
-	SrcIP     string `json:"src_ip,omitempty"`
-	SrcPort   int    `json:"src_port,omitempty"`
-	DstIP     string `json:"dst_ip,omitempty"`
-	DstPort   int    `json:"dst_port,omitempty"`
-	Domain    string `json:"domain,omitempty"`
-	DeviceID  string `json:"device_id,omitempty"`
+	UID      int    `json:"uid"`
+	Ts       string `json:"ts"`
+	Protocol string `json:"protocol"`
+	IPProto  int    `json:"ip_proto,omitempty"`
+	SrcIP    string `json:"src_ip,omitempty"`
+	SrcPort  int    `json:"src_port,omitempty"`
+	DstIP    string `json:"dst_ip,omitempty"`
+	DstPort  int    `json:"dst_port,omitempty"`
+	Domain   string `json:"domain,omitempty"`
+	DeviceID string `json:"device_id,omitempty"`
 }
 
 // AccessLogBatchSize bounds one request. The caller chunks rather than the
