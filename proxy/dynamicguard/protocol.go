@@ -27,6 +27,10 @@ const (
 	cookieReplySize    = 39
 	minClientInitSize  = 167 // 无 cookie / 无 PoW 时最小大小
 	maxClientInitSize  = 207 // 有 cookie + PoW 时最大大小
+
+	serverPongMsgType = byte(0xFC)
+	clientPingSize    = 85 // magic(4)+version(1)+user_key(32)+nonce(16)+mac(32)
+	serverPongSize    = 22 // magic(4)+version(1)+msg_type(1)+nonce(16)
 )
 
 // ClientInitMsg 表示解析后的 ClientInit 报文
@@ -40,6 +44,15 @@ type ClientInitMsg struct {
 	PowNonce    []byte // 0 或 8 字节
 	MAC         [32]byte
 	// 用于 MAC 验证的原始数据（magic 到 pow_nonce 末尾）
+	DataBeforeMAC []byte
+}
+
+// ClientPingMsg 表示解析后的 ClientPing 报文（无状态入口探测）
+type ClientPingMsg struct {
+	UserKey [32]byte
+	Nonce   [16]byte
+	MAC     [32]byte
+	// 用于 MAC 验证的原始数据（magic 到 nonce 末尾，53 字节）
 	DataBeforeMAC []byte
 }
 
@@ -140,7 +153,47 @@ func ParseClientInit(data []byte) (*ClientInitMsg, error) {
 	return msg, nil
 }
 
-// VerifyMAC 验证 ClientInit 的 MAC
+// isClientPing 按长度区分 ClientPing 与 ClientInit：ClientInit 为 167..207 字节，
+// ClientPing 固定 85 字节，二者不重叠，无需 msg_type 字段。
+func isClientPing(data []byte) bool {
+	return len(data) == clientPingSize
+}
+
+// ParseClientPing 解析 ClientPing 报文
+func ParseClientPing(data []byte) (*ClientPingMsg, error) {
+	if len(data) != clientPingSize {
+		return nil, errInvalidPacketSize
+	}
+	if data[0] != dgMagic[0] || data[1] != dgMagic[1] || data[2] != dgMagic[2] || data[3] != dgMagic[3] {
+		return nil, errInvalidMagic
+	}
+	if data[4] != dgVersion {
+		return nil, errUnsupportedVersion
+	}
+
+	msg := &ClientPingMsg{}
+	offset := 5
+	copy(msg.UserKey[:], data[offset:offset+32])
+	offset += 32
+	copy(msg.Nonce[:], data[offset:offset+16])
+	offset += 16
+	msg.DataBeforeMAC = make([]byte, offset)
+	copy(msg.DataBeforeMAC, data[:offset])
+	copy(msg.MAC[:], data[offset:])
+	return msg, nil
+}
+
+// BuildServerPong 构造 ServerPong 报文（明文，原样回显 ClientPing 的 nonce）
+func BuildServerPong(nonce [16]byte) []byte {
+	buf := make([]byte, serverPongSize)
+	copy(buf[:4], dgMagic[:])
+	buf[4] = dgVersion
+	buf[5] = serverPongMsgType
+	copy(buf[6:], nonce[:])
+	return buf
+}
+
+// VerifyMAC 验证 ClientInit / ClientPing 的 MAC
 func VerifyMAC(userKey [32]byte, clientNonce [16]byte, dataBeforeMAC []byte, mac [32]byte) bool {
 	computed, err := computeMAC(userKey, clientNonce, dataBeforeMAC)
 	if err != nil {

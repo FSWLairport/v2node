@@ -1,6 +1,6 @@
 # DynamicGuard 协议规范
 
-**版本**：2.1  
+**版本**：2.2  
 **传输层**：UDP  
 **隧道层**：标准 WireGuard（用户态实现）
 
@@ -13,6 +13,8 @@ DynamicGuard 是一个运行在 WireGuard 握手之前的轻量接入协议。�
 完整连接建立需要 2 个 RTT：1 个 RTT 用于 DynamicGuard，1 个 RTT 用于 WireGuard 握手。当服务端启用 Cookie + PoW 保护时，DynamicGuard 阶段增加为 2 个 RTT，总计 3 个 RTT。
 
 DynamicGuard 不修改 WireGuard 协议。
+
+除握手外，协议还定义了一对无状态的 ClientPing / ServerPong 控制消息（第 19 节），供客户端探测入口延迟。
 
 ---
 
@@ -68,9 +70,13 @@ wg_static_pub = X25519_Base(wg_static_priv)
 DynamicGuard 与 WireGuard 共享同一个 UDP 端口。服务端按以下规则分流：
 
 1. 若报文长度不足 5 字节，丢弃
-2. 若首 4 字节为 `0x44 0x47 0x30 0x31`（ASCII `"DG01"`），且长度满足对应消息最小长度，交给 DynamicGuard
-3. 若首字节为 `0x01`-`0x04` 或 `0x81`-`0x84`，交给 WireGuard（`0x81`-`0x84` 为经混淆层方向标记的 WireGuard 报文，详见第 25 节）
+2. 若首 4 字节为 `0x44 0x47 0x30 0x31`（ASCII `"DG01"`）且第 5 字节为 `0x01`，交给 DynamicGuard 控制面，再按长度分流：
+   - 长度恰为 **85 字节** → ClientPing（第 19 节）
+   - 其他长度 → ClientInit（167..207 字节，第 6 节）；长度不在范围内的丢弃
+3. 若首字节为 `0x01`-`0x04` 或 `0x81`-`0x84`，交给 WireGuard（`0x81`-`0x84` 为经混淆层方向标记的 WireGuard 报文，详见第 26 节）
 4. 其他情况丢弃
+
+ClientPing 与 ClientInit 长度区间不重叠，控制面无需 msg_type 字段即可区分；客户端发出的报文中只有这两种以 `"DG01"` 开头。
 
 ---
 
@@ -207,7 +213,7 @@ reply_key = HKDF-SHA256(
   ?     1       prefix_len
   ?     4       lease_ttl (u32 LE, 秒)
   ?     4       h1 (u32 LE)   ┐
-  ?     4       h2 (u32 LE)   │ AmneziaWG magic headers（见 §25）
+  ?     4       h2 (u32 LE)   │ AmneziaWG magic headers（见 §26）
   ?     4       h3 (u32 LE)   │
   ?     4       h4 (u32 LE)   ┘
   ?     2       s1 (u16 LE)   ┐ init/response junk 前缀字节数
@@ -217,7 +223,7 @@ reply_key = HKDF-SHA256(
   ?     2       jmax (u16 LE) ┘
 ```
 
-基础字段后 append **26 字节** AmneziaWG per-node 参数（h1-h4 各 u32 + s1/s2/jc/jmin/jmax 各 u16，全部小端），供客户端配置数据面 amnezia 设备（见 §25）。
+基础字段后 append **26 字节** AmneziaWG per-node 参数（h1-h4 各 u32 + s1/s2/jc/jmin/jmax 各 u16，全部小端），供客户端配置数据面 amnezia 设备（见 §26）。
 
 IPv4 payload：36 字节。IPv6 payload：48 字节。
 加上 auth tag（16 字节）：IPv4 ciphertext 52 字节，IPv6 ciphertext 64 字节。
@@ -504,6 +510,8 @@ idem_key = SHA256(user_key || device_id || client_eph_pub || wg_static_pub || cl
 - 按 user_key 限速
 - 设置最大并发 pending 数
 
+ClientPing 的处理开销止于「校验 MAC」一级（第 19 节），不触发 DH，不计入 pending 数；若实现了按源地址 / user_key 限速，同样适用于 ClientPing。
+
 ---
 
 ## 18. 断开与清理
@@ -514,39 +522,104 @@ idem_key = SHA256(user_key || device_id || client_eph_pub || wg_static_pub || cl
 
 ---
 
-## 19. 安全分析
+## 19. ClientPing / ServerPong
 
-### 19.1 控制层认证
+一对无状态控制消息，用于客户端**探测入口延迟**（选线、显示 RTT、判断入口是否可达）。它不是租约保活：不刷新 `last_seen`，不延长租约，不注册设备，也不建立任何会话状态；保活仍由 WireGuard 数据面流量完成（第 14 节）。
+
+### 19.1 ClientPing Wire Format
+
+```
+偏移   长度      字段
+────────────────────────────────
+  0     4       magic ("DG01")
+  4     1       version (0x01)
+  5    32       user_key
+ 37    16       nonce（客户端随机生成）
+ 53    32       mac
+```
+
+总大小：**85 字节**，固定。
+
+### 19.2 MAC 计算
+
+与 ClientInit 完全相同的构造（第 6.2 节），salt 换为本报文的 nonce：
+
+```
+mac_key = HKDF-SHA256(ikm = user_key, salt = nonce, info = "dynamicguard-mac-v1")
+mac     = HMAC-SHA256(mac_key, bytes[0:53])
+```
+
+### 19.3 ServerPong Wire Format
+
+```
+偏移   长度      字段
+────────────────────────────────
+  0     4       magic ("DG01")
+  4     1       version (0x01)
+  5     1       msg_type (0xFC)
+  6    16       nonce（原样回显 ClientPing 的 nonce）
+```
+
+总大小：**22 字节**，明文。客户端按 nonce 匹配发出的 Ping 并计算 RTT；nonce 不匹配的 Pong 丢弃。
+
+### 19.4 服务端处理
+
+1. 校验长度 == 85、magic、version
+2. 查 `user_key`；未找到 → 静默丢弃
+3. 校验 MAC；失败 → 静默丢弃
+4. 发送 ServerPong，源 IP 与收包的本机 IP 一致（源进源出）
+
+不做 X25519、不查设备表、不写幂等缓存、不走 Cookie / PoW、不计入 pending 连接数。每个 Ping 独立处理，重复的 Ping 各自得到一个 Pong。
+
+**过载保护**。Ping 是唯一绕过 Cookie / PoW 就会触发 HMAC 的路径，所以服务端对它另有两道闸，客户端都感知为"这轮无应答"：
+
+- pending 的 ClientInit 数超过高负载阈值时，Ping 在计算任何哈希之前静默丢弃——此时 ClientInit 会被 CookieReply 顶回，Ping 没有 cookie 可顶，只能不理。
+- Ping 由单个 worker 串行处理，前面有一个有界队列（实现值 1024）；队列满即丢，不记日志。这样 Ping 洪水最多占满一个核，不会拖慢同一 socket 上的 WireGuard 数据面，也不会每包起一个 goroutine。
+
+客户端因此**不得**把单轮无应答当作入口不可达；判定切换要求连续多轮无应答（sing-box 实现为 3 轮）。
+
+### 19.5 安全性
+
+- **无放大**：Pong（22B）短于 Ping（85B），伪造源地址的攻击者拿不到放大倍数
+- **静默丢弃**：所有失败路径无响应，与第 20.6 节一致，无法用 Ping 枚举 `user_key`
+- **不可重放利用**：Pong 不携带任何服务端状态，重放旧 Ping 只会得到同一个 nonce 的回显
+- Pong 明文回显 nonce，不泄露 `user_key`；被动观察者可知某地址在探测该入口，与其能观察到握手本身无差别
+
+---
+
+## 20. 安全分析
+
+### 20.1 控制层认证
 
 ClientInit 的 MAC 证明客户端持有 `user_key`。ServerReply 的 AEAD 解密成功证明服务端持有 `server_wg_priv`（因为 `reply_key` 依赖 `DH(client_eph, server_static)`）。双向认证在一个 RTT 内完成。
 
-### 19.2 前向安全
+### 20.2 前向安全
 
 控制层具备客户端侧前向安全：每次连接使用随机 `client_eph_priv`，握手完成后丢弃。事后泄露 `user_key` 不影响历史会话。
 
 控制层不具备服务端侧前向安全：若攻击者事后同时获得 `server_wg_priv` 和 `user_key`，且保存了历史 ClientInit 和 ServerReply，则可恢复历史控制层明文。控制层传输的内容仅为 IP 分配信息，敏感度低。WireGuard 隧道自身的 Noise IK 模式提供完整的双向前向安全，业务数据不受影响。
 
-### 19.3 user_key 泄露影响
+### 20.3 user_key 泄露影响
 
 攻击者可以注册新设备并获取隧道地址。不能冒充已有设备（不知道其 `wg_static_priv`，且服务端拒绝在线替换公钥）。不能解密已有设备的 WireGuard 隧道流量。
 
 响应措施：轮换 `user_key` 并重新下发配置，审计设备表中的异常记录。
 
-### 19.4 设备身份
+### 20.4 设备身份
 
 已注册设备的 `wg_static_pub` 不可在线替换。这确保了即使 `user_key` 泄露，攻击者也无法接管现有设备的身份或 IP。设备重置需要管理员介入。
 
-### 19.5 信任边界
+### 20.5 信任边界
 
 系统的根信任单位是用户（`user_key`），不是设备。这是预设条件决定的。如需收紧到设备级信任，需引入带外的单设备凭据机制。
 
-### 19.6 错误处理
+### 20.6 错误处理
 
-所有认证失败（user_key 无效、MAC 错误、设备被撤销、公钥不匹配、设备数超限、地址池耗尽）均静默丢弃。攻击者无法通过错误响应区分失败原因，无法枚举有效 user_key 或探测设备状态。
+所有认证失败（user_key 无效、MAC 错误、设备被撤销、公钥不匹配、设备数超限、地址池耗尽）均静默丢弃，ClientPing 亦然。攻击者无法通过错误响应区分失败原因，无法枚举有效 user_key 或探测设备状态。
 
 ---
 
-## 20. 客户端状态机
+## 21. 客户端状态机
 
 ```
 IDLE
@@ -571,22 +644,40 @@ CONFIGURING
 CONNECTED
   ├─ 隧道故障 ─────────────────────> IDLE（重新开始）
   ├─ 用户断开 ─────────────────────> IDLE
+  ├─ 本机网络接口变更 ─────────────> CONNECTED（仅重开 UDP socket，见下）
 
 FAILED
   ├─ 指数退避后 ───────────────────> IDLE
   ├─ 达到最大重试 ─────────────────> ERROR（提示用户）
+  ├─ 本机网络接口变更 ─────────────> CONNECTING（重新握手）
 ```
+
+### 21.1 本机网络接口变更（换网漫游）
+
+客户端换网（WiFi ↔ 蜂窝、WAN 重拨、默认路由切换）不需要重新执行 DynamicGuard 握手：
+
+- **CONNECTED**：只重开 UDP socket。WireGuard 会话密钥仍在内存中，服务端从下一个合法
+  WireGuard 报文的来源地址学到新 endpoint（标准 WireGuard 漫游，服务端无需改动）。
+- **FAILED**：重新进入 CONNECTING。典型场景是设备在 WAN 就绪前启动，握手重试耗尽后停在
+  FAILED；没有这条边，FAILED 会一直持续到进程重启。
+
+以上只处理**本机**地址的漂移，不切换服务端地址。
 
 ---
 
-## 21. 服务端处理模型
+## 22. 服务端处理模型
 
 服务端为无状态请求-响应模型 + 幂等缓存：
 
 ```
 收到 UDP 包
-  ├─ 首 4 字节 = "DG01"
-  │    ├─ magic/version 错误         → 丢弃
+  ├─ 首 4 字节 = "DG01"，长度 = 85（ClientPing）
+  │    ├─ user_key 未找到            → 静默丢弃
+  │    ├─ MAC 校验失败              → 静默丢弃
+  │    └─ 正常                      → 发送 ServerPong
+  │
+  ├─ 首 4 字节 = "DG01"，其他长度（ClientInit）
+  │    ├─ magic/version/长度错误     → 丢弃
   │    ├─ user_key 未找到            → 静默丢弃
   │    ├─ 高负载且无 cookie          → 发送 CookieReply
   │    ├─ cookie 校验失败            → 静默丢弃
@@ -606,16 +697,16 @@ FAILED
 
 ---
 
-## 22. HKDF 标签注册表
+## 23. HKDF 标签注册表
 
 | info 字符串 | 用途 | ikm | salt |
 |-------------|------|-----|------|
-| `"dynamicguard-mac-v1"` | ClientInit MAC key | user_key | client_nonce |
+| `"dynamicguard-mac-v1"` | ClientInit / ClientPing MAC key | user_key | client_nonce / ping nonce |
 | `"dynamicguard-reply-v1"` | ServerReply AEAD key | dh \|\| user_key | client_nonce \|\| server_nonce |
 
 ---
 
-## 23. 报文大小汇总
+## 24. 报文大小汇总
 
 | 报文 | 大小 | 加密 |
 |------|------|------|
@@ -624,18 +715,20 @@ FAILED
 | ServerReply（IPv4） | 73 字节 | AEAD（含 26B AmneziaWG 参数）|
 | ServerReply（IPv6） | 85 字节 | AEAD（含 26B AmneziaWG 参数）|
 | CookieReply | 39 字节 | 明文 |
+| ClientPing | 85 字节 | 明文 + MAC |
+| ServerPong | 22 字节 | 明文 |
 
 完整握手开销（DynamicGuard + WireGuard，IPv4，不含 IP/UDP 头，不含重传）：约 **460 字节**。
 
 ---
 
-## 24. sing-box 客户端配置
+## 25. sing-box 客户端配置
 
 DynamicGuard 在 sing-box 中作为 **endpoint** 类型实现，类型名为 `dynamicguard`。它在内部包装了标准 WireGuard endpoint：启动时先完成 DynamicGuard 握手获取隧道地址，然后自动创建 WireGuard 隧道。
 
 需要 build tag：`with_wireguard`。
 
-### 24.1 配置格式
+### 25.1 配置格式
 
 ```jsonc
 {
@@ -644,9 +737,13 @@ DynamicGuard 在 sing-box 中作为 **endpoint** 类型实现，类型名为 `dy
       "type": "dynamicguard",
       "tag": "dg-ep",
 
-      // === DynamicGuard 必填字段 ===
-      "server": "vpn.example.com",       // 服务端地址（IP 或域名）
+      // === DynamicGuard 服务端地址 ===
+      "server": "vpn.example.com",       // 默认地址（IP 或域名）
       "server_port": 51820,              // 服务端 UDP 端口
+      "servers": [                       // 同一节点的其他地址（可选，见 §25.5）
+        {"server": "203.0.113.7", "server_port": 51820}
+      ],
+      "probe_interval": "10m",           // 多地址时的稳态探测间隔（可选）
       "user_key": "BASE64...",           // 用户级共享密钥（Base64，32 字节）
       "server_public_key": "BASE64...",  // 服务端 WireGuard 公钥（Base64，32 字节）
 
@@ -683,12 +780,14 @@ DynamicGuard 在 sing-box 中作为 **endpoint** 类型实现，类型名为 `dy
 }
 ```
 
-### 24.2 字段说明
+### 25.2 字段说明
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `server` | string | ✅ | — | 服务端地址（IP 或域名） |
-| `server_port` | uint16 | ✅ | — | 服务端 UDP 端口 |
+| `server` | string | 与 `servers` 二选一 | — | 默认服务端地址（IP 或域名） |
+| `server_port` | uint16 | 随 `server` | — | 服务端 UDP 端口 |
+| `servers` | \[object\] | 与 `server` 二选一 | `[]` | 同一节点的其他地址，每项 `{server, server_port}`，见 §25.5 |
+| `probe_interval` | duration | — | `10m` | 候选 ≥2 时稳态探测的间隔 |
 | `user_key` | string | ✅ | — | Base64 编码的 32 字节用户密钥 |
 | `server_public_key` | string | ✅ | — | Base64 编码的服务端 WireGuard 公钥 |
 | `allowed_ips` | \[string\] | — | `[]` | CIDR 列表，同 WireGuard AllowedIPs |
@@ -702,7 +801,7 @@ DynamicGuard 在 sing-box 中作为 **endpoint** 类型实现，类型名为 `dy
 | `persistent_keepalive_interval` | uint16 | — | `0` | PersistentKeepalive 间隔（秒），建议设为 25 |
 | `udp_timeout` | duration | — | `5m` | UDP 会话超时时间 |
 
-### 24.3 状态文件格式
+### 25.3 状态文件格式
 
 `state_path` 指定的文件使用 JSON 格式存储：
 
@@ -718,7 +817,7 @@ DynamicGuard 在 sing-box 中作为 **endpoint** 类型实现，类型名为 `dy
 
 首次启动时自动生成并写入，后续启动自动加载。文件权限为 `0600`。
 
-### 24.4 最小配置示例
+### 25.4 最小配置示例
 
 ```json
 {
@@ -740,13 +839,44 @@ DynamicGuard 在 sing-box 中作为 **endpoint** 类型实现，类型名为 `dy
 
 ---
 
-## 25. 数据面抗 DPI 混淆层（AmneziaWG）
+### 25.5 多地址：候选列表、探测与切换
+
+`server`/`server_port` 与 `servers` 合成一个**候选列表**：默认地址排首位，`servers` 按写入
+顺序跟在后面，重复的 host:port 去重。只写其中一种即可；候选只有一个时行为与单地址完全一致，
+不探测、不切换。优先级分层（备用地址）不在协议层：控制面只下发当前层的地址，客户端在拿到的
+候选里择优，不自行跨层。
+
+候选 ≥2 时：
+
+| 时刻 | 动作 |
+|------|------|
+| 启动 / 从 FAILED 重试 | 并发向全部候选发 ClientPing（一轮 ≤ 500ms），取 RTT 最低者做 ClientInit；无人应答（旧服务端不认 Ping）则按列表顺序 |
+| 稳态，每 `probe_interval` | 再探一轮，只更新 RTT 快照。**当前地址连续 3 轮无 Pong 且有其他候选应答**时切换 |
+| 本机接口变更 | §20.1 的 rebind 之后立刻补探一轮 |
+
+切换不重新握手：客户端把 UDP socket 重新 connect 到新地址，再把 WireGuard peer 的 endpoint
+改过去。会话密钥仍在内存，服务端从下一个报文的来源地址学到新 endpoint（与 §20.1 同一机制），
+服务端无需任何改动。从不因为"另一个地址快几十毫秒"而切换：切换会让服务端重学 endpoint、
+NAT 重建映射，不值。
+
+状态快照（api service `SubscribeEndpoints`）暴露 `endpoint`（当前拨的 host:port，按配置原样）
+和 `serverRttMs`（上一轮每个候选的毫秒数，-1 = 无应答；单候选时为空）。
+
+跨节点的择优不在内核里：控制面把候选节点连同各自的地址交给客户端（固件 agent / App），
+由客户端决定把哪个节点写进配置。内核只提供探针——api service 的 `ProbeDynamicGuard`（单次最多 64 个地址，超出拒绝；api service 在 loopback 无鉴权，这是对本机进程的上限）
+RPC（请求 `userKey` = base64 的 32 字节 user_key，`servers` = 任意 host:port 列表，非空；
+响应 `rttMs` 为每个请求地址的毫秒数，-1 = 无应答）。它对每个地址连发两轮 ClientPing
+（每轮 ≤ 500ms）取最低值，无状态，不碰任何端点；报文经内核的默认 dialer 发出，与不带
+dialer 选项的 DynamicGuard 端点握手走同一条路（bind_interface / protect / 扩展进程），
+所以不会被 tun 自己吞掉。仅 `with_wireguard` 构建实现，否则返回 `Unimplemented`。
+
+## 26. 数据面抗 DPI 混淆层（AmneziaWG）
 
 DynamicGuard 握手完成后承载的是 WireGuard 数据面流量。为消除 WireGuard 握手报文固定的首 4 字节 `type` 指纹与固定包长，数据面采用 **AmneziaWG**（WireGuard 的抗 DPI 变体）替代标准 WireGuard。
 
 > **历史**：早期版本在 bind 层对 WireGuard 报文做对称混淆（`type|0x80` 方向位、reserved 字段 HMAC 掩码、尾部 padding、`"SKY"` XOR）。该方案已废弃——它在跨包/跨节点维度是零熵固定指纹，且 mac2 偏移固定可被静态规则识别。现已整体迁移到 AmneziaWG，bind 层退化为纯透传。
 
-### 25.1 混淆机制
+### 26.1 混淆机制
 
 AmneziaWG 在 WireGuard 协议层（而非 bind 层）施加三类变换，全部由设备参数驱动：
 
@@ -758,7 +888,7 @@ AmneziaWG 在 WireGuard 协议层（而非 bind 层）施加三类变换，全�
 
 magic header 在协议层写入并**参与 MAC1 计算**，因此必须在握手报文构造时即就位——这是它无法在 bind 层事后替换的根本原因。
 
-### 25.2 per-node 参数
+### 26.2 per-node 参数
 
 参数**按节点（per-node）**生成，而非全局硬编码：
 
@@ -769,7 +899,7 @@ magic header 在协议层写入并**参与 MAC1 计算**，因此必须在握手
 - 不同节点 / 不同部署拥有不同参数，跨节点不再是恒定指纹——这是抗"校园网计费网关静态签名匹配"威胁模型的核心。
 - 进程级共享（非 per-link）：AmneziaWG 的 magic header 在服务端为包级全局，同进程多个 DGServer 必须共用一组。
 
-### 25.3 参数下发
+### 26.3 参数下发
 
 客户端通过 **DG01 ServerReply** 获取该节点的参数（见 §7.3，加密载荷尾部追加 26 字节）：
 
@@ -779,7 +909,7 @@ magic header 在协议层写入并**参与 MAC1 计算**，因此必须在握手
 
 DG01 控制报文自身不参与 AmneziaWG 混淆（首 4 字节仍是 `DG01` magic + version）。
 
-### 25.4 实现
+### 26.4 实现
 
 两端均使用 AmneziaWG 的 ASec 实现：
 

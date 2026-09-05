@@ -61,7 +61,21 @@ type DGServer struct {
 	readLoopDone  sync.WaitGroup
 	handshakeDone sync.WaitGroup
 	closeOnce     sync.Once
+	// pingQueue 把 ClientPing 从 readLoop 摘出来交给一个 worker：Ping 是唯一不受
+	// cookie/PoW 保护就会碰 HMAC 的路径，洪水时既不能每包一个 goroutine，也不能
+	// 在 readLoop 里同步算——那会拖慢同一 socket 上所有人的 WireGuard 数据面。
+	// 队列有界，满了就丢：探测是 best-effort，客户端只是少一轮数据。
+	pingQueue chan pingJob
 }
+
+type pingJob struct {
+	data      []byte
+	src       *net.UDPAddr
+	localAddr netip.Addr
+}
+
+// pingQueueSize 是 worker 追不上时允许积压的 Ping 数；再多的直接丢。
+const pingQueueSize = 1024
 
 // NewDGServer 创建 DG 服务端
 func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
@@ -239,6 +253,7 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		serverWGPriv: serverWGPriv,
 		leaseTTL:     settings.LeaseTTL,
 		stopCh:       make(chan struct{}),
+		pingQueue:    make(chan pingJob, pingQueueSize),
 	}, nil
 }
 
@@ -269,9 +284,11 @@ func (s *DGServer) Start() error {
 	// 启动租约管理
 	s.leaseMgr.Start()
 
-	// 启动 UDP 读取循环
+	// 启动 UDP 读取循环和 Ping worker
 	s.readLoopDone.Add(1)
 	go s.readLoop()
+	s.readLoopDone.Add(1)
+	go s.pingLoop()
 
 	log.WithFields(log.Fields{
 		"listen":         s.udpConn.LocalAddr().String(),
@@ -397,16 +414,26 @@ func (s *DGServer) readLoop() {
 		data := buf[:n]
 
 		if IsDynamicGuardPacket(data) {
-			// DG 握手（低频）：拷贝数据后立即归还池缓冲区
+			// DG 控制面（低频）：拷贝数据后立即归还池缓冲区
 			dgData := make([]byte, n)
 			copy(dgData, data)
 			pktPool.Put(bufPtr)
 			udpAddr := net.UDPAddrFromAddrPort(addrPort)
-			s.handshakeDone.Add(1)
-			go func() {
-				defer s.handshakeDone.Done()
-				s.handler.HandleClientInit(dgData, udpAddr, s.udpConn, localAddr)
-			}()
+			// 按长度分流：ClientPing 固定 85 字节，ClientInit 为 167..207 字节，
+			// 二者不重叠，85 字节的包永远不会进入 HandleClientInit。
+			if isClientPing(dgData) {
+				select {
+				case s.pingQueue <- pingJob{data: dgData, src: udpAddr, localAddr: localAddr}:
+				default:
+					// 队列满 = 正在被 Ping 洪水冲；丢掉，不记日志，日志本身也是成本。
+				}
+			} else {
+				s.handshakeDone.Add(1)
+				go func() {
+					defer s.handshakeDone.Done()
+					s.handler.HandleClientInit(dgData, udpAddr, s.udpConn, localAddr)
+				}()
+			}
 		} else {
 			// 非 DG01 控制包 = AmneziaWG 数据/握手（首 4 字节为自定义 h1-h4 magic
 			// header，非固定 0x01-04，无法按 type 判定）。统一零拷贝送入 bind，
@@ -417,6 +444,19 @@ func (s *DGServer) readLoop() {
 				LocalAddr: localAddr,
 				buf:       bufPtr,
 			})
+		}
+	}
+}
+
+// pingLoop 是唯一处理 ClientPing 的 goroutine：一次一个，CPU 上限就是一个核。
+func (s *DGServer) pingLoop() {
+	defer s.readLoopDone.Done()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case job := <-s.pingQueue:
+			s.handler.HandlePing(job.data, job.src, s.udpConn, job.localAddr)
 		}
 	}
 }

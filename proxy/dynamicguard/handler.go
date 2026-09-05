@@ -63,6 +63,43 @@ func NewHandler(cfg *HandlerConfig) *Handler {
 	}
 }
 
+// HandlePing 处理 ClientPing 报文：查 user_key、验 MAC、回 ServerPong。
+// 无状态，不做 DH、不碰设备表 / 幂等缓存 / cookie，不计入 pendingCount。
+// Pong（22B）短于 Ping（85B），不构成放大。
+//
+// 高负载（pending 的 ClientInit 超过 highLoadThreshold）时在算任何哈希之前静默
+// 丢弃：ClientInit 此时会被 CookieReply 顶回去，Ping 没有 cookie 可顶，只能不理。
+// 客户端本来就把无应答当"这轮没数据"，不会因此判定入口死了——那要连续几轮。
+func (h *Handler) HandlePing(data []byte, srcAddr *net.UDPAddr, udpConn *net.UDPConn, localAddr netip.Addr) {
+	if h.pendingCount.Load() > int64(highLoadThreshold) {
+		return
+	}
+	msg, err := ParseClientPing(data)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"src":          srcAddr.String(),
+			"packet_bytes": len(data),
+			"err":          err,
+		}).Debug("[DynamicGuard] parse ClientPing failed")
+		return // 静默丢弃
+	}
+	user := h.userKeyMap.Get(msg.UserKey)
+	if user == nil {
+		log.WithField("src", srcAddr.String()).Debug("[DynamicGuard] ping: unknown user key")
+		return // 静默丢弃
+	}
+	if !VerifyMAC(msg.UserKey, msg.Nonce, msg.DataBeforeMAC, msg.MAC) {
+		log.WithFields(log.Fields{
+			"src":     srcAddr.String(),
+			"user_id": user.UserID,
+		}).Debug("[DynamicGuard] ping: MAC verification failed")
+		return // 静默丢弃
+	}
+	if _, err := writeUDPWithSrc(udpConn, BuildServerPong(msg.Nonce), srcAddr, localAddr); err != nil {
+		log.Debugf("[DynamicGuard] send pong failed: %v", err)
+	}
+}
+
 // HandleClientInit 处理 ClientInit 报文（协议第 9 节 14 步）
 func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *net.UDPConn, localAddr netip.Addr) {
 	h.pendingCount.Add(1)
