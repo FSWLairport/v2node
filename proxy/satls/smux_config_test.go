@@ -1,6 +1,16 @@
 package satls
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/sagernet/smux"
+)
+
+func TestSATLSSmuxStreamWindowRaisedAboveLibraryDefault(t *testing.T) {
+	if got, def := satlsSmuxConfig().MaxStreamBuffer, smux.DefaultConfig().MaxStreamBuffer; got <= def {
+		t.Fatalf("MaxStreamBuffer = %d, must exceed the library default %d or high-RTT streams stall at window/RTT", got, def)
+	}
+}
 
 func TestSATLSSmuxKeepAliveLeavesMarginOverSpecHeartbeat(t *testing.T) {
 	conf := satlsSmuxConfig()

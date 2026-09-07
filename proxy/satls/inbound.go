@@ -609,6 +609,11 @@ func satlsSmuxConfig() *smux.Config {
 	conf.Version = 2
 	conf.KeepAliveInterval = satlsKeepAliveInterval
 	conf.KeepAliveTimeout = satlsKeepAliveTimeout
+	// Upload-direction window: smux v2 caps a stream at window/RTT, and the
+	// library default 64 KiB is ~2.6 Mbps at 200 ms. A ceiling, not a
+	// preallocation. MaxReceiveBuffer stays at the default because this side is
+	// shared by every user on the node.
+	conf.MaxStreamBuffer = satlsSmuxMaxStreamBuffer
 	return conf
 }
 

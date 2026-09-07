@@ -34,6 +34,8 @@ const (
 	// session behind a black-holed link versus the 90s the spec allows.
 	satlsKeepAliveTimeout = 45 * time.Second
 
+	satlsSmuxMaxStreamBuffer = 1 << 20
+
 	// streamMetadataTimeout bounds the TLV read that opens a stream. A client
 	// that drops mid-TLV (common on mobile) would otherwise park this stream's
 	// goroutine until the whole smux session times out.
