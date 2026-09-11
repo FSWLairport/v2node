@@ -14,7 +14,7 @@ func TestSATLSSmuxStreamWindowRaisedAboveLibraryDefault(t *testing.T) {
 
 func TestSATLSSmuxKeepAliveLeavesMarginOverSpecHeartbeat(t *testing.T) {
 	conf := satlsSmuxConfig()
-	// SATLS.md 7.1 lets a conforming peer send NOP only every 30s, and smux
+	// SATLS.md section 5 lets a conforming peer send NOP only every 30s, and smux
 	// judges liveness on a fixed ticker rather than a timer reset by traffic,
 	// so a read timeout at or near that interval kills healthy sessions on the
 	// tick boundary.

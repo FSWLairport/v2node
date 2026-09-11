@@ -100,7 +100,7 @@ func (h *Handler) HandlePing(data []byte, srcAddr *net.UDPAddr, udpConn *net.UDP
 	}
 }
 
-// HandleClientInit 处理 ClientInit 报文（协议第 9 节 14 步）
+// HandleClientInit 处理 ClientInit 报文（DynamicGuard.md 第 5 节）
 func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *net.UDPConn, localAddr netip.Addr) {
 	h.pendingCount.Add(1)
 	defer h.pendingCount.Add(-1)

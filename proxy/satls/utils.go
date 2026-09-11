@@ -23,7 +23,7 @@ const (
 	sessionReplayTTL     = 5 * time.Minute
 	splitDownTimeout     = 10 * time.Second
 
-	// satlsSpecMaxNOPInterval is the slowest heartbeat SATLS.md 7.1 permits a
+	// satlsSpecMaxNOPInterval is the slowest heartbeat SATLS.md section 5 permits a
 	// conforming peer to send.
 	satlsSpecMaxNOPInterval = 30 * time.Second
 	satlsKeepAliveInterval  = satlsSpecMaxNOPInterval

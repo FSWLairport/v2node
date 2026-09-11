@@ -405,7 +405,7 @@ func (w *WGDevice) GetBind() *DGBind {
 }
 
 // CollectTrafficDelta 通过 WG IPC 读取 peer 流量统计，返回增量
-// 同时更新有流量的 peer 对应设备的 last_seen（协议第 14 节）
+// 同时更新有流量的 peer 对应设备的 last_seen（DynamicGuard.md 第 7 节）
 // 返回 map[peer_pubkey][upload, download]
 func (w *WGDevice) CollectTrafficDelta() map[[32]byte][2]int64 {
 	w.mu.Lock()

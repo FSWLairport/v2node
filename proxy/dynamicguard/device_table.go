@@ -127,7 +127,7 @@ func (dt *DeviceTable) Register(entry *DeviceEntry) error {
 	return nil
 }
 
-// UpdateLastSeen 更新设备最后活跃时间（协议第 14 节：收到有效 WG 包时调用）
+// UpdateLastSeen 更新设备最后活跃时间（DynamicGuard.md 第 7 节：收到有效 WG 包时调用）
 func (dt *DeviceTable) UpdateLastSeen(wgPub [32]byte, t time.Time) {
 	dt.mu.Lock()
 	entry, ok := dt.byWGPub[wgPub]

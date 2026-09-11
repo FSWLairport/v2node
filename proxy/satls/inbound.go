@@ -207,8 +207,17 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 		return err
 	}
 	fallbackTarget = s.pickFallbackTarget(req, sni)
-	body, err := io.ReadAll(req.Body)
-	req.Body.Close()
+	if !strings.EqualFold(req.Method, "SATLS") {
+		// Ordinary fallback requests stream their bodies to the backend.
+		s.handleFallback(ctx, newCachedConn(conn, reader), req, nil, fallbackTarget, sni)
+		return nil
+	}
+	body, err := readPadding(req)
+	if errors.Is(err, errPaddingTooLarge) {
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		s.writeErrorResponse(conn, http.StatusRequestEntityTooLarge, "")
+		return err
+	}
 	if err != nil {
 		s.sleepFallbackDelay()
 		log.Record(&log.GeneralMessage{
@@ -263,6 +272,22 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	}
 }
 
+var errPaddingTooLarge = stderrs.New("satls: padding too large")
+
+func readPadding(req *http.Request) ([]byte, error) {
+	if req.ContentLength > maxPaddingSize {
+		return nil, errPaddingTooLarge
+	}
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxPaddingSize+1))
+	if len(body) > maxPaddingSize {
+		return nil, errPaddingTooLarge
+	}
+	if err == nil {
+		err = req.Body.Close()
+	}
+	return body, err
+}
+
 func (s *Server) acceptTLS(raw net.Conn) (net.Conn, string, error) {
 	serverConf := s.tlsConfig.Clone()
 	serverConf.NextProtos = []string{"http/1.1"}
@@ -274,6 +299,7 @@ func (s *Server) acceptTLS(raw net.Conn) (net.Conn, string, error) {
 			if cert, err := s.upCerts.get(); err == nil {
 				conf := serverConf.Clone()
 				conf.Certificates = []tls.Certificate{*cert}
+				conf.GetCertificate = nil
 				return conf, nil
 			}
 		}
@@ -281,6 +307,7 @@ func (s *Server) acceptTLS(raw net.Conn) (net.Conn, string, error) {
 			if cert, err := s.downCerts.get(); err == nil {
 				conf := serverConf.Clone()
 				conf.Certificates = []tls.Certificate{*cert}
+				conf.GetCertificate = nil
 				return conf, nil
 			}
 		}
@@ -310,10 +337,7 @@ type handshakeRequest struct {
 func (s *Server) handleFallback(ctx context.Context, conn net.Conn, req *http.Request, body []byte, targetHost string, sni string) {
 	_ = conn.SetDeadline(time.Time{})
 	if req != nil {
-		if req.Body != nil {
-			req.Body.Close()
-		}
-		if len(body) > 0 {
+		if body != nil {
 			req.Body = io.NopCloser(bytes.NewReader(body))
 		}
 	}
@@ -449,13 +473,10 @@ func (s *Server) handleSplitDown(ctx context.Context, conn net.Conn, info *hands
 		return stderrs.New("satls: unknown session")
 	}
 	// reconnect allowed, handled by attachDown
-	status, errAttach := session.attachDown(conn, info.reconnect)
+	_, errAttach := session.attachDown(conn, info.reconnect)
 	if errAttach != nil {
 		s.writeErrorResponse(conn, http.StatusConflict, errAttach.Error())
 		return errAttach
-	}
-	if err := writeSwitchingProtocols(conn, status); err != nil {
-		return err
 	}
 	<-session.done
 	return session.Err()
@@ -693,10 +714,10 @@ func (s *splitSession) attachDown(conn net.Conn, reconnect bool) (string, error)
 	s.downMu.Lock()
 	defer s.downMu.Unlock()
 	status := "Established"
-	s.stopTimer()
-	if s.pausedTimer != nil {
-		s.pausedTimer.Stop()
-		s.pausedTimer = nil
+	select {
+	case <-s.done:
+		return status, net.ErrClosed
+	default:
 	}
 	switch s.state {
 	case splitStateWaiting:
@@ -714,6 +735,15 @@ func (s *splitSession) attachDown(conn net.Conn, reconnect bool) (string, error)
 		}
 	default:
 		return status, stderrs.New("satls: session closed")
+	}
+	// Keep writers excluded until HTTP upgrade has reached the new connection.
+	if err := writeSwitchingProtocols(conn, status); err != nil {
+		return status, err
+	}
+	s.stopTimer()
+	if s.pausedTimer != nil {
+		s.pausedTimer.Stop()
+		s.pausedTimer = nil
 	}
 	s.downConn = conn
 	s.state = splitStateActive
@@ -775,11 +805,16 @@ func (s *splitSession) flushBufferLocked() error {
 	if s.buffer.Len() == 0 {
 		return nil
 	}
-	reader := bytes.NewReader(s.buffer.Bytes())
-	if _, err := io.Copy(s.downConn, reader); err != nil {
-		return err
+	for s.buffer.Len() > 0 {
+		n, err := s.downConn.Write(s.buffer.Bytes())
+		s.buffer.Next(n)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
 	}
-	s.buffer.Reset()
 	return nil
 }
 
@@ -805,25 +840,28 @@ func (s *splitSession) notifyReady() {
 }
 
 func (s *splitSession) close(err error) {
-	s.setErr(err)
-	s.stopTimer()
-	s.state = splitStateClosed
-	s.notifyReady()
-	s.doneOnce.Do(func() { close(s.done) })
-	if s.upConn != nil {
-		_ = s.upConn.Close()
-		s.upConn = nil
-	}
-	s.downMu.Lock()
-	if s.downConn != nil {
-		_ = s.downConn.Close()
-		s.downConn = nil
-	}
-	if s.pausedTimer != nil {
-		s.pausedTimer.Stop()
-		s.pausedTimer = nil
-	}
-	s.downMu.Unlock()
+	s.doneOnce.Do(func() {
+		s.setErr(err)
+		s.stopTimer()
+		// Wake the DOWN handler first so its owner closes a socket even when a
+		// writer currently holds downMu. upConn remains immutable for mux readers.
+		close(s.done)
+		if s.upConn != nil {
+			_ = s.upConn.Close()
+		}
+		s.downMu.Lock()
+		s.state = splitStateClosed
+		if s.downConn != nil {
+			_ = s.downConn.Close()
+			s.downConn = nil
+		}
+		if s.pausedTimer != nil {
+			s.pausedTimer.Stop()
+			s.pausedTimer = nil
+		}
+		s.downMu.Unlock()
+		s.notifyReady()
+	})
 }
 
 func (s *splitSession) stopTimer() {
@@ -880,15 +918,7 @@ func (c *splitConn) Write(p []byte) (int, error) {
 }
 
 func (c *splitConn) Close() error {
-	err1 := c.session.upConn.Close()
-	c.session.downMu.Lock()
-	if c.session.downConn != nil {
-		_ = c.session.downConn.Close()
-	}
-	c.session.downMu.Unlock()
-	if err1 != nil {
-		return err1
-	}
+	c.session.close(nil)
 	return nil
 }
 

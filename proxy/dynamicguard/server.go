@@ -80,6 +80,9 @@ const pingQueueSize = 1024
 // NewDGServer 创建 DG 服务端
 func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 	settings := cfg.DGSettings
+	if settings.PowDifficulty > 24 {
+		return nil, fmt.Errorf("pow_difficulty must be between 0 and 24")
+	}
 
 	// 设置默认值
 	if settings.LeaseTTL == 0 {
