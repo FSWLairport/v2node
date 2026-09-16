@@ -28,6 +28,7 @@ type NodeConfig struct {
 	Key        string `mapstructure:"ApiKey"`
 	Timeout    int    `mapstructure:"Timeout"`
 	RetryCount *int   `mapstructure:"RetryCount"`
+	Insecure   bool   `mapstructure:"Insecure"` // skip panel TLS certificate verification
 }
 
 func New() *Conf {
