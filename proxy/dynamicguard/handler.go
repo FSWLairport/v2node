@@ -1,6 +1,8 @@
 package dynamicguard
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/netip"
@@ -18,6 +20,43 @@ type UserEntry struct {
 	DeviceLimit int
 	SpeedLimit  int
 	GroupID     int
+	// Pinned 时只有 DeviceID + WGStaticPub 这一台设备能用这条凭据；别的设备静默丢弃。
+	// PinBroken：面板给了钉住信息但解析不了，这条凭据拒绝所有设备，宁可拒绝也不放行。
+	Pinned      bool
+	PinBroken   bool
+	DeviceID    [16]byte
+	WGStaticPub [32]byte
+}
+
+// Pin 把凭据钉在面板给的那台设备上。解析不了就标 PinBroken，这条凭据拒绝所有设备。
+func (u *UserEntry) Pin(deviceIDHex, wgStaticPubB64 string) error {
+	u.Pinned, u.PinBroken = true, true
+	deviceID, err := hex.DecodeString(deviceIDHex)
+	if err == nil && len(deviceID) != len(u.DeviceID) {
+		err = fmt.Errorf("dg_device_id is %d bytes, want %d", len(deviceID), len(u.DeviceID))
+	}
+	if err != nil {
+		return fmt.Errorf("pinned dg_device_id: %w", err)
+	}
+	pub, err := base64.StdEncoding.DecodeString(wgStaticPubB64)
+	if err == nil && len(pub) != len(u.WGStaticPub) {
+		err = fmt.Errorf("wg_static_pub is %d bytes, want %d", len(pub), len(u.WGStaticPub))
+	}
+	if err != nil {
+		return fmt.Errorf("pinned wg_static_pub: %w", err)
+	}
+	copy(u.DeviceID[:], deviceID)
+	copy(u.WGStaticPub[:], pub)
+	u.PinBroken = false
+	return nil
+}
+
+// Allows 报告这台设备能否用这条凭据：没钉住谁都行，钉住了只认那一台，钉坏了谁都不行。
+func (u *UserEntry) Allows(deviceID [16]byte, wgStaticPub [32]byte) bool {
+	if !u.Pinned {
+		return true
+	}
+	return !u.PinBroken && deviceID == u.DeviceID && wgStaticPub == u.WGStaticPub
 }
 
 // Handler 处理 ClientInit 报文
@@ -185,6 +224,17 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 			"user_id": user.UserID,
 			"device":  fmt.Sprintf("%x", msg.DeviceID[:4]),
 		}).Debug("[DynamicGuard] MAC verification failed")
+		return // 静默丢弃
+	}
+
+	// 凭据钉在一台设备上时，别的设备即使持有 user_key 也不能注册
+	if !user.Allows(msg.DeviceID, msg.WGStaticPub) {
+		log.WithFields(log.Fields{
+			"src":     srcAddr.String(),
+			"user_id": user.UserID,
+			"device":  fmt.Sprintf("%x", msg.DeviceID[:4]),
+			"pinned":  fmt.Sprintf("%x", user.DeviceID[:4]),
+		}).Warn("[DynamicGuard] device not pinned to credential")
 		return // 静默丢弃
 	}
 

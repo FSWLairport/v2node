@@ -172,14 +172,20 @@ func (c *Controller) updateDGUsers(dgServer *dynamicguard.DGServer) {
 	users := make([]*dynamicguard.UserEntry, 0, len(c.userList))
 	for _, u := range c.userList {
 		userKey := dynamicguard.UserKeyFromUUID(u.Uuid)
-		users = append(users, &dynamicguard.UserEntry{
+		entry := &dynamicguard.UserEntry{
 			UserID:      u.Id,
 			UUID:        u.Uuid,
 			UserKey:     userKey,
 			DeviceLimit: u.DeviceLimit,
 			SpeedLimit:  u.SpeedLimit,
 			GroupID:     u.GroupID,
-		})
+		}
+		if u.DGDeviceID != "" || u.WGStaticPub != "" {
+			if err := entry.Pin(u.DGDeviceID, u.WGStaticPub); err != nil {
+				log.WithFields(log.Fields{"tag": c.tag, "user_id": u.Id, "err": err}).Warn("DynamicGuard credential pin unusable; it rejects every device")
+			}
+		}
+		users = append(users, entry)
 	}
 	dgServer.UpdateUsers(users)
 }

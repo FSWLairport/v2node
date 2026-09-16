@@ -14,6 +14,11 @@ WireGuard。两份仓库中的本文保持一致。
 不可在线替换；设备状态丢失后应通过管理端处理旧记录。v2node 当前从凭据 UUID 字符串的
 SHA-256 派生 `user_key`；客户端配置接收已经派生的 32 字节值，而不是直接填写 UUID。
 
+面板用户列表可为一条凭据带上 `dg_device_id` + `wg_static_pub`，把它钉在唯一一台设备上
+（App 注册的那台，或云端给盒子签发的身份）：ClientInit 的 `device_id`/`wg_static_pub`
+对不上就静默丢弃，泄露的 `user_key` 也注册不了新设备。两个字段都缺是没钉，任何设备都能
+以新设备注册（只受 `device_limit` 约束）；给了但解析不了则这条凭据拒绝所有设备。
+
 客户端 `state_path` 保存设备 ID 和私钥，JSON 格式如下，写入权限为 0600：
 
 ```json
@@ -133,10 +138,11 @@ difficulty=0 时只回传 Cookie，不发送 PoW nonce。没有 Cookie 挑战且
 1. 校验报文格式、版本和长度，按 `user_key` 查用户。
 2. 必要时校验 Cookie、PoW，或者发送挑战。
 3. 校验 ClientInit MAC。
-4. 查询幂等缓存。
-5. 持有设备锁重新检查用户凭据，查设备、分配或复用 IP、注册 WireGuard peer。
-6. 派生响应密钥，加密并发送分配结果与混淆参数。
-7. 缓存已发送的响应。
+4. 凭据钉了设备的，核对 `device_id` 与 `wg_static_pub`。
+5. 查询幂等缓存。
+6. 持有设备锁重新检查用户凭据，查设备、分配或复用 IP、注册 WireGuard peer。
+7. 派生响应密钥，加密并发送分配结果与混淆参数。
+8. 缓存已发送的响应。
 
 缓存键为：
 
@@ -145,7 +151,7 @@ SHA256(user_key || device_id || client_eph_pub || wg_static_pub || client_nonce)
 ```
 
 缓存保留 60 秒；相同请求重发原响应。缓存绑定上述完整字段，不等同于永久设备授权。
-无效凭据、MAC、Cookie、PoW、撤销设备、公钥不匹配、设备超限或地址池耗尽均静默丢弃。
+无效凭据、MAC、Cookie、PoW、非钉住设备、撤销设备、公钥不匹配、设备超限或地址池耗尽均静默丢弃。
 
 设备记录包含用户、设备 ID、WireGuard 公钥、分配地址、权限组、最后活跃时间以及
 `active` / `disconnected` / `revoked` 状态。设备公钥和分配地址有唯一约束。活动设备重连
