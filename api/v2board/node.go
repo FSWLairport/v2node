@@ -67,6 +67,15 @@ type CommonNode struct {
 	SatlsSettings           *SatlsSettings `json:"satls_settings"`
 	//dynamicguard
 	DGSettings *DGNodeSettings `json:"dg_settings,omitempty"`
+	// Egress source addresses, one per family; empty lets the host choose, so
+	// a panel that never sends them (v2board) keeps the shared default outbound.
+	// With both families set the node gets an outbound per family and
+	// dual-stack destinations prefer IPv4.
+	EgressIPv4 string `json:"egress_ipv4,omitempty"`
+	EgressIPv6 string `json:"egress_ipv6,omitempty"`
+	// EgressFwmark is the SO_MARK put on every outbound socket this node opens,
+	// for policy routing on the host. Zero (or absent) leaves sockets unmarked.
+	EgressFwmark uint32 `json:"egress_fwmark,omitempty"`
 }
 
 type DGNodeSettings struct {

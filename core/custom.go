@@ -33,6 +33,15 @@ func hasPublicIPv6() bool {
 	return false
 }
 
+func hasDefaultOut(routes []panel.Route) bool {
+	for _, route := range routes {
+		if route.Action == "default_out" {
+			return true
+		}
+	}
+	return false
+}
+
 func hasOutboundWithTag(list []*core.OutboundHandlerConfig, tag string) bool {
 	for _, o := range list {
 		if o != nil && o.Tag == tag {
@@ -225,6 +234,49 @@ func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHand
 				coreOutboundConfig = append(coreOutboundConfig, custom_outbound)
 			default:
 				continue
+			}
+		}
+	}
+	// Per-node egress comes after every node's own routes so those still win;
+	// a node that names its own default_out keeps it. One source address (or a
+	// bare fwmark) is one outbound behind a catch-all rule. A source per family
+	// is two outbounds selected by destination family, IPv4 first so dual-stack
+	// destinations prefer it; domain destinations only reach those rules once
+	// the router resolves them, hence IPIfNonMatch.
+	for _, info := range infos {
+		if info.Common.Protocol == "dynamicguard" || hasDefaultOut(info.Common.Routes) {
+			continue
+		}
+		v4, v6, fwmark := info.Common.EgressIPv4, info.Common.EgressIPv6, info.Common.EgressFwmark
+		if v4 == "" && v6 == "" && fwmark == 0 {
+			continue
+		}
+		type egressRule struct {
+			tag, via, strategy string
+			match              map[string]interface{}
+		}
+		var rules []egressRule
+		switch {
+		case v4 != "" && v6 != "":
+			rules = []egressRule{
+				{"egress-" + info.Tag + "-v4", v4, "UseIPv4", map[string]interface{}{"ip": []string{"0.0.0.0/0"}}},
+				{"egress-" + info.Tag + "-v6", v6, "UseIPv6", map[string]interface{}{"ip": []string{"::/0"}}},
+			}
+			domainStrategy = "IPIfNonMatch"
+		default:
+			rules = []egressRule{{"egress-" + info.Tag, v4 + v6, "UseIPv4v6", map[string]interface{}{"network": "tcp,udp"}}}
+		}
+		for _, r := range rules {
+			egress, err := buildEgressOutbound(r.tag, r.via, r.strategy, fwmark)
+			if err != nil {
+				continue
+			}
+			r.match["inboundTag"] = info.Tag
+			r.match["outboundTag"] = r.tag
+			rawRule, _ := json.Marshal(r.match)
+			coreRouterConfig.RuleList = append(coreRouterConfig.RuleList, rawRule)
+			if !hasOutboundWithTag(coreOutboundConfig, r.tag) {
+				coreOutboundConfig = append(coreOutboundConfig, egress)
 			}
 		}
 	}

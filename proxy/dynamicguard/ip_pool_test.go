@@ -220,3 +220,32 @@ func TestNewIPPoolRejectsInvalidCIDR(t *testing.T) {
 		t.Fatal("expected error for invalid CIDR")
 	}
 }
+
+// 父池给嵌套子池让位：子段里的地址一个都不能再从父池发出去，段外照常。
+func TestIPPoolReservePrefixSkipsNestedRange(t *testing.T) {
+	pool, err := NewIPPool("10.0.0.0/28") // .1 - .14
+	if err != nil {
+		t.Fatalf("NewIPPool: %v", err)
+	}
+	pool.ReservePrefix(netip.MustParsePrefix("10.0.0.4/30")) // .4 - .7
+	pool.ReservePrefix(netip.MustParsePrefix("10.0.0.0/30")) // .0 - .3，网络地址和本池重合
+	pool.ReservePrefix(netip.MustParsePrefix("10.9.0.0/30")) // 不在池内，忽略
+	pool.ReservePrefix(netip.MustParsePrefix("10.0.0.0/24")) // 比本池大，忽略
+	var got []string
+	for {
+		ip, err := pool.Allocate()
+		if err != nil {
+			break
+		}
+		got = append(got, ip.String())
+	}
+	want := []string{"10.0.0.8", "10.0.0.9", "10.0.0.10", "10.0.0.11", "10.0.0.12", "10.0.0.13", "10.0.0.14"}
+	if len(got) != len(want) {
+		t.Fatalf("allocated %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("allocated %v, want %v", got, want)
+		}
+	}
+}

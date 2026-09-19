@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -158,15 +159,33 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		return nil, fmt.Errorf("enable pktinfo: %w", err)
 	}
 
-	// 收集所有 IP 池的网关地址和子网前缀（按 CIDR 去重，共享池只处理一次）
+	// 嵌套的池：父池把子池整段让出来，否则两个独立位图会发出同一个地址。
+	// 只给根池（不被任何池包含）绑网关地址：父池那条 connected route 已经覆盖
+	// 全部子池，子池再绑地址只是白烧一个 IP。
+	distinctPools := make([]*IPPool, 0, len(cidrToPool))
+	for _, pool := range cidrToPool {
+		distinctPools = append(distinctPools, pool)
+	}
+	rootPools := make([]*IPPool, 0, len(distinctPools))
+	for _, pool := range distinctPools {
+		nested := false
+		for _, other := range distinctPools {
+			if other == pool || !other.network.Contains(pool.network.Addr()) || other.network.Bits() >= pool.network.Bits() {
+				continue
+			}
+			other.ReservePrefix(pool.network)
+			nested = true
+		}
+		if !nested {
+			rootPools = append(rootPools, pool)
+		}
+	}
+	sort.Slice(rootPools, func(i, j int) bool { return rootPools[i].network.Addr().Less(rootPools[j].network.Addr()) })
+
+	// 收集根池的网关地址和子网前缀
 	var tunnelAddrs []netip.Addr
 	var ipPrefixes []netip.Prefix
-	seenPool := make(map[*IPPool]struct{})
-	for _, pool := range ipPools {
-		if _, dup := seenPool[pool]; dup {
-			continue
-		}
-		seenPool[pool] = struct{}{}
+	for _, pool := range rootPools {
 		gwAddr := pool.network.Addr().Next()
 		tunnelAddrs = append(tunnelAddrs, gwAddr)
 		ipPrefixes = append(ipPrefixes, pool.network)

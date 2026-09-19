@@ -98,6 +98,30 @@ func (p *IPPool) Reserve(ip netip.Addr) bool {
 	return true
 }
 
+// ReservePrefix 把一个嵌套子网的整段标记为已分配，供父池给子池让位：
+// 面板允许在一个池里再切小段（租户段、网络段），各段是独立的位图，父池不让位
+// 就会把子段里的地址再发一遍，WireGuard 里同一个 /32 只能属于一个 peer，先来的
+// 设备会静默断网。子网不在本池内时什么都不做。
+func (p *IPPool) ReservePrefix(sub netip.Prefix) {
+	sub = sub.Masked()
+	if !p.network.Contains(sub.Addr()) || sub.Bits() <= p.network.Bits() {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	start, ok := p.indexOf(sub.Addr())
+	if !ok {
+		// 子网的网络地址就是本池的网络地址（base 之前一位），从 0 开始。
+		start = 0
+	}
+	for idx := start; idx < p.size; idx++ {
+		if !sub.Contains(p.addrAtIndex(idx)) {
+			break
+		}
+		p.bitmap[idx/64] |= 1 << (idx % 64)
+	}
+}
+
 // Release 释放 IP 地址
 func (p *IPPool) Release(ip netip.Addr) {
 	p.mu.Lock()
