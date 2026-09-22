@@ -159,19 +159,36 @@ SHA256(user_key || device_id || client_eph_pub || wg_static_pub || client_nonce)
 
 ## 6. 地址池、路由与访问控制
 
-v2node 的 `ip_pools` 按网络/权限组配置，值为 CIDR。相同 CIDR 的组共享池实例，避免重复
-分配；各用户所属组决定使用哪个池。池可以嵌套（面板在一个入口的池里再给租户、网络切
-小段）：启动时父池把每个嵌套子池的整段标记为已分配，只从子段之外发地址；分配给设备的
-`prefix_len` 仍是它所在那个池的前缀。只有根池（不被任何池包含的）在隧道接口上绑网关
-地址 `网络地址+1`，嵌套池不再各自占一个网关，父池的 connected route 已覆盖它们。
+`ip_pools` 以全局唯一 Network ID（`group_id`）为键。每个 Network 是一份池视图，所有
+视图在当前 DG 节点内共用地址占用记录和分配锁，因此相等、包含或部分重叠的范围都不会
+重复发地址。独立 DG 进程不共享租约；多个 DG 服务同一 Network 时应规划各自地址段，
+切换节点不保证 IP 不变。
 
-客户端 `routes` 控制入口流量的目标范围、系统路由及路由偏好，不是服务端授权策略。
-内部 WireGuard peer 的 AllowedIPs 固定覆盖 IPv4/IPv6 默认路由，使 sing-box 显式选择该
-endpoint 作为下一跳时可以访问任意目标。服务端限制由按组配置的 ACL 强制执行，不把不同
-组的规则合并，也不将 ACL 下发给客户端。
+`tenant_pools` 以客户 `org_id` 为键，携带该节点全部客户保留段，包含未挂载 Network
+的客户；保留段在客户之间必须互不重叠。客户有保留段时，自己的 Network 池必须在段内；
+没有保留段时继承节点池，不能自行切段。每个视图排除其他客户的保留段，即使保留段等于
+整个节点池，也不能给其他客户发地址。同客户 Network 段允许重叠，共享容量而非独占配额。
+只有根池在隧道接口上绑定 `网络地址+1` 网关，该地址在共享占用记录中保留。
 
-`allowed_ips` 不是当前 sing-box DynamicGuard JSON 配置字段；旧示例应迁移到 `routes`，
-不能将它们理解为完全相同的授权含义。
+`acl[network_id].org_id` 声明 Network 的客户归属；节点用户名单同时携带 `org_id`、
+`group_id`、凭据和设备公钥 pin。转发包的身份来自已认证租约，WireGuard 的源地址约束
+把包绑定到设备；客户端不能通过包内容选择客户或 Network。未知来源、缺失策略、客户
+与 Network 归属不匹配全部拒绝。其他客户的活跃租约地址和保留段先行拒绝，随后才匹配
+本 Network 的有序目标 CIDR 规则。允许全部目标也不会关闭这层客户隔离，格式损坏的
+规则使该 Network 拒绝转发。
+
+客户端 `routes` 只决定入口流量、系统路由及偏好；ACL 仅在节点执行，不下发客户端，也
+不把不同 Network 的允许规则合并。客户 LAN 若共享相同目标前缀及主机路由表，仍需
+主机侧独立路由域；这层隔离不替代 VRF/namespace。`allowed_ips` 不是 sing-box
+DynamicGuard JSON 字段，旧配置应改用 `routes`。
+
+升级先更新面板投影，再更新节点：新节点要求配置含客户归属。配置变化仍触发节点重载，
+内存租约随之重建。用户名单中的客户、Network 或设备 pin 变化会先拆除旧 peer。
+VIP 准入由面板过滤凭据名单，节点不从客户端接收“VIP”声明。
+
+目前同一设备在多个 Network 中仍使用一个 WireGuard 公钥；同一 DG 的唯一公钥约束
+禁止该公钥同时注册到多个凭据。多 Network 并行场景应使用不同设备身份，同一设备的
+并行接入需要后续身份协议改造，不能通过放宽公钥 pin 解决。
 
 ## 7. 租约、断开与恢复
 
@@ -315,7 +332,7 @@ replace github.com/sagernet/wireguard-go => ./third_party/wireguard-go
 
 两端协议编码检查涵盖 ClientInit MAC、Cookie/PoW、IPv4/IPv6 ServerReply 参数和 Ping/Pong。
 客户端回归测试另外覆盖同 socket Cookie 往返、挑战次数、取消、PoW 上限、故障观察及
-隧道重建。服务端检查配置中的 PoW 难度上限。
+隧道重建。服务端检查配置中的 PoW 难度上限，并回归共享出口保留段、同客户重叠 Network 分配、多节点独立租约及 allow-all 下的客户隔离。
 
 这些检查不替代真实网络环境中的路由、MTU、NAT、ACL、系统 TUN 和吞吐测试。当前凭据
 明文传输等协议设计边界沿用原行为；WireGuard 数据面加密与控制面的凭据设计应分别评估。

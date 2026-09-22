@@ -24,6 +24,7 @@ type UserInfo struct {
 	Uuid        string `json:"uuid" msgpack:"uuid"`
 	SpeedLimit  int    `json:"speed_limit" msgpack:"speed_limit"`
 	DeviceLimit int    `json:"device_limit" msgpack:"device_limit"`
+	OrgID       int    `json:"org_id" msgpack:"org_id"`
 	GroupID     int    `json:"group_id" msgpack:"group_id"`
 	// DGDeviceID / WGStaticPub 把凭据钉在唯一一台 DynamicGuard 设备上（App 注册的
 	// 那台，或云端给盒子签发的身份）；空表示面板没钉，任何设备都能用这条凭据注册。

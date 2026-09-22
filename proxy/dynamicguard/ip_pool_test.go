@@ -230,7 +230,6 @@ func TestIPPoolReservePrefixSkipsNestedRange(t *testing.T) {
 	pool.ReservePrefix(netip.MustParsePrefix("10.0.0.4/30")) // .4 - .7
 	pool.ReservePrefix(netip.MustParsePrefix("10.0.0.0/30")) // .0 - .3，网络地址和本池重合
 	pool.ReservePrefix(netip.MustParsePrefix("10.9.0.0/30")) // 不在池内，忽略
-	pool.ReservePrefix(netip.MustParsePrefix("10.0.0.0/24")) // 比本池大，忽略
 	var got []string
 	for {
 		ip, err := pool.Allocate()

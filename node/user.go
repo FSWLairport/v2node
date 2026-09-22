@@ -217,7 +217,7 @@ func compareUserList(old, new []panel.UserInfo) (deleted, added, modified []pane
 		if o, ok := oldMap[u.Uuid]; !ok {
 			added = append(added, u)
 		} else {
-			if o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit || o.DGDeviceID != u.DGDeviceID || o.WGStaticPub != u.WGStaticPub {
+			if o.OrgID != u.OrgID || o.GroupID != u.GroupID || o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit || o.DGDeviceID != u.DGDeviceID || o.WGStaticPub != u.WGStaticPub {
 				modified = append(modified, u)
 			}
 			delete(oldMap, u.Uuid)

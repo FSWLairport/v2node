@@ -25,6 +25,7 @@ type DeviceEntry struct {
 	AssignedIP  netip.Addr
 	LastSeen    time.Time
 	Status      DeviceStatus
+	OrgID       int `json:"org_id" msgpack:"org_id"`
 	GroupID     int
 }
 
@@ -230,6 +231,17 @@ func (dt *DeviceTable) GroupIDByIP(ip netip.Addr) (int, bool) {
 		return 0, false
 	}
 	return entry.GroupID, true
+}
+
+// ScopeByIP returns the authenticated lease scope, never packet-supplied metadata.
+func (dt *DeviceTable) ScopeByIP(ip netip.Addr) (org, group int, ok bool) {
+	dt.mu.RLock()
+	defer dt.mu.RUnlock()
+	entry, ok := dt.byIP[ip]
+	if !ok || entry.Status == DeviceStatusRevoked || entry.Status == DeviceStatusDisconnected {
+		return 0, 0, false
+	}
+	return entry.OrgID, entry.GroupID, true
 }
 
 // OwnerByIP resolves a tunnel address to the credential and device holding it.

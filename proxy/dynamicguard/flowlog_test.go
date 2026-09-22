@@ -148,7 +148,7 @@ func TestFlowLogIgnoresUnleasedSources(t *testing.T) {
 func TestACLWriteWithoutAccessLogStaysAllocationFree(t *testing.T) {
 	inner := &fakeTUN{countOnly: true}
 	dt := leaseTable(t, map[string]int{"10.0.0.2": 7})
-	a := newACLTUN(inner, dt, nil, false)
+	a := newACLTUN(inner, dt, newACLPolicy(map[string]DGACL{"7": {OrgID: 1, Default: "allow"}}), false)
 	bufs := [][]byte{tcpPacket("10.0.0.2", "1.1.1.1", 51544, 443, 6)}
 	if allocs := testing.AllocsPerRun(100, func() {
 		if _, err := a.Write(bufs, testOffset); err != nil {
@@ -164,10 +164,10 @@ func TestACLWriteWithoutAccessLogStaysAllocationFree(t *testing.T) {
 
 // With no ACL policy at all, logging still has to see forwarded packets: the
 // two features share the hook but not the reason to run.
-func TestACLWriteRecordsFlowsWithoutAPolicy(t *testing.T) {
+func TestACLWriteRecordsFlowsWithAllowPolicy(t *testing.T) {
 	inner := &fakeTUN{}
 	dt := leaseTable(t, map[string]int{"10.0.0.2": 7})
-	a := newACLTUN(inner, dt, nil, true)
+	a := newACLTUN(inner, dt, newACLPolicy(map[string]DGACL{"7": {OrgID: 1, Default: "allow"}}), true)
 	writeAll(t, a, tcpPacket("10.0.0.2", "1.1.1.1", 51544, 443, 6))
 	if len(inner.written) != 1 {
 		t.Fatalf("forwarded %d packets, want 1", len(inner.written))
@@ -183,7 +183,7 @@ func TestACLWriteDoesNotRecordDeniedPackets(t *testing.T) {
 	inner := &fakeTUN{}
 	dt := leaseTable(t, map[string]int{"10.0.0.2": 7})
 	a := newACLTUN(inner, dt, newACLPolicy(map[string]DGACL{
-		"7": {Default: "deny"},
+		"7": {OrgID: 1, Default: "deny"},
 	}), true)
 	writeAll(t, a, tcpPacket("10.0.0.2", "1.1.1.1", 51544, 443, 6))
 	if len(inner.written) != 0 {

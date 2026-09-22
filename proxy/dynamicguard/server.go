@@ -20,7 +20,8 @@ type DGSettings struct {
 	ServerWGKeyPath   string            `json:"server_wg_key_path"`
 	ServerWGPublicKey string            `json:"server_wg_public_key"`
 	LeaseTTL          uint32            `json:"lease_ttl"`
-	IPPools           map[string]string `json:"ip_pools"` // group_id(string) -> CIDR
+	TenantPools       map[string]string `json:"tenant_pools"` // org -> reserved CIDR, including tenants without attached networks
+	IPPools           map[string]string `json:"ip_pools"`     // group_id(string) -> CIDR
 	// Routes 只是客户端分流配置（哪些目标送进隧道），服务端不据此过滤。
 	Routes []string `json:"routes"`
 	// ACL 是服务端强制的出网策略，按网络（group_id 字符串）区分，绝不做并集，
@@ -120,23 +121,9 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		return nil, err
 	}
 
-	// 创建 IP 池（相同 CIDR 的多个 group 共享同一实例，避免重叠分配）
-	cidrToPool := make(map[string]*IPPool)
-	ipPools := make(map[int]*IPPool)
-	for groupStr, cidr := range settings.IPPools {
-		groupID := 0
-		fmt.Sscanf(groupStr, "%d", &groupID)
-		pool, exists := cidrToPool[cidr]
-		if !exists {
-			var err error
-			pool, err = NewIPPool(cidr)
-			if err != nil {
-				return nil, fmt.Errorf("create IP pool for group %s (%s): %w", groupStr, cidr, err)
-			}
-			cidrToPool[cidr] = pool
-		}
-		ipPools[groupID] = pool
-		log.Infof("[DynamicGuard] IP pool group=%d cidr=%s", groupID, cidr)
+	ipPools, cidrToPool, err := buildIPPools(settings)
+	if err != nil {
+		return nil, err
 	}
 
 	// 绑定 UDP 端口
@@ -159,7 +146,7 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		return nil, fmt.Errorf("enable pktinfo: %w", err)
 	}
 
-	// 嵌套的池：父池把子池整段让出来，否则两个独立位图会发出同一个地址。
+	// 所有视图共享地址占用记录；嵌套范围不需要在同客户的父池中整段排除。
 	// 只给根池（不被任何池包含）绑网关地址：父池那条 connected route 已经覆盖
 	// 全部子池，子池再绑地址只是白烧一个 IP。
 	distinctPools := make([]*IPPool, 0, len(cidrToPool))
@@ -173,7 +160,6 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 			if other == pool || !other.network.Contains(pool.network.Addr()) || other.network.Bits() >= pool.network.Bits() {
 				continue
 			}
-			other.ReservePrefix(pool.network)
 			nested = true
 		}
 		if !nested {
@@ -189,7 +175,7 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		gwAddr := pool.network.Addr().Next()
 		tunnelAddrs = append(tunnelAddrs, gwAddr)
 		ipPrefixes = append(ipPrefixes, pool.network)
-		pool.Reserve(gwAddr)
+		pool.used[gwAddr] = pool
 		log.WithFields(log.Fields{
 			"gateway": gwAddr.String(),
 			"network": pool.network.String(),
@@ -230,7 +216,7 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		Prefixes:    ipPrefixes,
 		Params:      awgParams,
 		DeviceTable: deviceTable,
-		ACL:         newACLPolicy(settings.ACL),
+		ACL:         newACLPolicy(settings.ACL, settings.TenantPools),
 
 		AccessLogEnabled: cfg.AccessLogEnabled,
 	})

@@ -11,7 +11,8 @@ type IPPool struct {
 	base    netip.Addr // 网络地址 + 1 (跳过网络地址)
 	size    uint32     // 可用地址数
 	bitmap  []uint64   // 位图追踪已分配地址
-	mu      sync.Mutex
+	mu      *sync.Mutex
+	used    map[netip.Addr]*IPPool
 }
 
 // NewIPPool 从 CIDR 字符串创建 IP 地址池
@@ -53,6 +54,7 @@ func NewIPPool(cidr string) (*IPPool, error) {
 		base:    base,
 		size:    size,
 		bitmap:  make([]uint64, bitmapLen),
+		mu:      &sync.Mutex{}, used: map[netip.Addr]*IPPool{},
 	}, nil
 }
 
@@ -71,7 +73,8 @@ func (p *IPPool) Allocate() (netip.Addr, error) {
 			if idx >= p.size {
 				return netip.Addr{}, errIPPoolExhausted
 			}
-			if p.bitmap[i]&(1<<bit) == 0 {
+			if p.bitmap[i]&(1<<bit) == 0 && p.used[p.addrAtIndex(idx)] == nil {
+				p.used[p.addrAtIndex(idx)] = p
 				p.bitmap[i] |= 1 << bit
 				return p.addrAtIndex(idx), nil
 			}
@@ -91,20 +94,18 @@ func (p *IPPool) Reserve(ip netip.Addr) bool {
 	}
 	word := idx / 64
 	bit := idx % 64
-	if p.bitmap[word]&(1<<bit) != 0 {
+	if p.bitmap[word]&(1<<bit) != 0 || p.used[ip] != nil {
 		return false // 已被占用
 	}
+	p.used[ip] = p
 	p.bitmap[word] |= 1 << bit
 	return true
 }
 
-// ReservePrefix 把一个嵌套子网的整段标记为已分配，供父池给子池让位：
-// 面板允许在一个池里再切小段（租户段、网络段），各段是独立的位图，父池不让位
-// 就会把子段里的地址再发一遍，WireGuard 里同一个 /32 只能属于一个 peer，先来的
-// 设备会静默断网。子网不在本池内时什么都不做。
+// ReservePrefix excludes a tenant reservation from this pool view, including the whole pool.
 func (p *IPPool) ReservePrefix(sub netip.Prefix) {
 	sub = sub.Masked()
-	if !p.network.Contains(sub.Addr()) || sub.Bits() <= p.network.Bits() {
+	if !p.network.Overlaps(sub) {
 		return
 	}
 	p.mu.Lock()
@@ -131,6 +132,10 @@ func (p *IPPool) Release(ip netip.Addr) {
 	if !ok {
 		return
 	}
+	if p.used[ip] != p {
+		return
+	}
+	delete(p.used, ip)
 	word := idx / 64
 	bit := idx % 64
 	p.bitmap[word] &^= 1 << bit

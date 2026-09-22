@@ -19,6 +19,7 @@ type UserEntry struct {
 	UserKey     [32]byte
 	DeviceLimit int
 	SpeedLimit  int
+	OrgID       int `json:"org_id" msgpack:"org_id"`
 	GroupID     int
 	// Pinned 时只有 DeviceID + WGStaticPub 这一台设备能用这条凭据；别的设备静默丢弃。
 	// PinBroken：面板给了钉住信息但解析不了，这条凭据拒绝所有设备，宁可拒绝也不放行。
@@ -292,6 +293,7 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 			// disconnected 设备重连：IP 已被释放，需重新分配
 			// 同步 GroupID（用户可能被移到新权限组）
 			entry.GroupID = user.GroupID
+			entry.OrgID = user.OrgID
 			pool, ok := h.ipPools[user.GroupID]
 			if !ok {
 				log.Warnf("[DynamicGuard] no IP pool for group %d", user.GroupID)
@@ -358,6 +360,7 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 			LastSeen:    time.Now(),
 			Status:      DeviceStatusActive,
 			GroupID:     user.GroupID,
+			OrgID:       user.OrgID,
 		}
 
 		if err := h.deviceTable.Register(entry); err != nil {

@@ -15,6 +15,7 @@ import (
 // dg_settings.routes: routes only tell the client what to send into the tunnel,
 // while the ACL decides what the node is willing to forward once it arrives.
 type DGACL struct {
+	OrgID   int         `json:"org_id"`
 	Default string      `json:"default"`
 	Rules   []DGACLRule `json:"rules"`
 }
@@ -37,22 +38,21 @@ type aclRule struct {
 }
 
 type networkACL struct {
+	org          int
 	rules        []aclRule
 	defaultAllow bool
 }
 
 // aclPolicy holds the compiled per-network policies. A nil *aclPolicy means
-// "nothing to enforce" and skips the whole check.
+// fail closed; customer isolation applies even to allow-all networks.
 type aclPolicy struct {
-	networks map[int]networkACL
+	networks     map[int]networkACL
+	reservations map[int]netip.Prefix
 }
 
-// newACLPolicy compiles the panel payload. It returns nil when no network
-// restricts anything, so an absent or all-allow ACL costs nothing on the data
-// path and behaves exactly like a node without ACL support.
-func newACLPolicy(acl map[string]DGACL) *aclPolicy {
+// newACLPolicy always enforces trusted scope and tenant isolation.
+func newACLPolicy(acl map[string]DGACL, tenantPools ...map[string]string) *aclPolicy {
 	networks := make(map[int]networkACL, len(acl))
-	restricts := false
 
 	for groupStr, cfg := range acl {
 		groupID, err := strconv.Atoi(groupStr)
@@ -73,9 +73,10 @@ func newACLPolicy(acl map[string]DGACL) *aclPolicy {
 			prefix, err := netip.ParsePrefix(r.CIDR)
 			if err != nil {
 				// The panel validates CIDRs, so this only happens on a
-				// corrupted payload. Skipping the rule is loud enough here.
-				log.Errorf("[DynamicGuard] ACL network=%d: invalid CIDR %q, rule ignored: %v", groupID, r.CIDR, err)
-				continue
+				// corrupted payload. Deny the whole network rather than dropping a deny rule.
+				log.Errorf("[DynamicGuard] ACL network=%d: invalid CIDR %q, network denied: %v", groupID, r.CIDR, err)
+				rules, defaultAllow = nil, false
+				break
 			}
 			allow := r.Action == aclActionAllow
 			if r.Action != aclActionAllow && r.Action != aclActionDeny {
@@ -84,26 +85,30 @@ func newACLPolicy(acl map[string]DGACL) *aclPolicy {
 			rules = append(rules, aclRule{prefix: prefix.Masked(), allow: allow})
 		}
 
-		networks[groupID] = networkACL{rules: rules, defaultAllow: defaultAllow}
-		if !defaultAllow || len(rules) > 0 {
-			restricts = true
-		}
+		networks[groupID] = networkACL{org: cfg.OrgID, rules: rules, defaultAllow: defaultAllow}
 		log.Infof("[DynamicGuard] ACL network=%d default=%s rules=%d", groupID, cfg.Default, len(rules))
 	}
 
-	if !restricts {
-		return nil
+	p := &aclPolicy{networks: networks, reservations: map[int]netip.Prefix{}}
+	for _, pools := range tenantPools {
+		for org, cidr := range pools {
+			id, err := strconv.Atoi(org)
+			prefix, pe := netip.ParsePrefix(cidr)
+			if err != nil || pe != nil || id <= 0 {
+				return &aclPolicy{}
+			}
+			p.reservations[id] = prefix.Masked()
+		}
 	}
-	return &aclPolicy{networks: networks}
+	return p
 }
 
 // allows reports whether a client of the given network may reach dst.
-// A network the panel did not send an ACL for is unfiltered, which keeps the
-// upgrade window behaving like today.
+// Missing network policy denies access.
 func (p *aclPolicy) allows(groupID int, dst netip.Addr) bool {
 	n, ok := p.networks[groupID]
 	if !ok {
-		return true
+		return false
 	}
 	for i := range n.rules {
 		if n.rules[i].prefix.Contains(dst) {
@@ -139,7 +144,12 @@ func newACLTUN(inner tun.Device, devices *DeviceTable, policy *aclPolicy, access
 }
 
 // SetPolicy swaps the whole policy atomically; the data path never locks.
-func (a *aclTUN) SetPolicy(p *aclPolicy) { a.policy.Store(p) }
+func (a *aclTUN) SetPolicy(p *aclPolicy) {
+	if p == nil {
+		p = newACLPolicy(nil)
+	}
+	a.policy.Store(p)
+}
 
 // Dropped returns the number of packets denied so far.
 func (a *aclTUN) Dropped() uint64 { return a.dropped.Load() }
@@ -147,9 +157,6 @@ func (a *aclTUN) Dropped() uint64 { return a.dropped.Load() }
 func (a *aclTUN) Write(bufs [][]byte, offset int) (int, error) {
 	policy := a.policy.Load()
 	logging := a.flows.enabled.Load()
-	if policy == nil && !logging {
-		return a.Device.Write(bufs, offset)
-	}
 
 	// filtered stays nil while everything passes, which is the common case and
 	// keeps this path allocation free.
@@ -160,7 +167,7 @@ func (a *aclTUN) Write(bufs [][]byte, offset int) (int, error) {
 		now = time.Now()
 	}
 	for i, buf := range bufs {
-		if policy == nil || a.permit(policy, buf, offset) {
+		if policy != nil && a.permit(policy, buf, offset) {
 			// Only forwarded packets are recorded: a denied one never reached
 			// anything, and logging it would describe a connection that did not
 			// happen.
@@ -193,7 +200,7 @@ func (a *aclTUN) Write(bufs [][]byte, offset int) (int, error) {
 }
 
 func (a *aclTUN) permit(policy *aclPolicy, buf []byte, offset int) bool {
-	if offset > len(buf) {
+	if offset < 0 || offset > len(buf) {
 		return false
 	}
 	src, dst, ok := packetAddrs(buf[offset:])
@@ -203,9 +210,21 @@ func (a *aclTUN) permit(policy *aclPolicy, buf []byte, offset int) bool {
 	// The source address is the peer's tunnel IP, so its lease tells us which
 	// network the packet belongs to. An address with no lease has no network
 	// and is denied rather than sent through unfiltered.
-	groupID, known := a.devices.GroupIDByIP(src)
-	if !known {
+	org, groupID, known := a.devices.ScopeByIP(src)
+	if !known || org <= 0 {
 		return false
+	}
+	scope, ok := policy.networks[groupID]
+	if !ok || scope.org != org {
+		return false
+	}
+	if targetOrg, _, known := a.devices.ScopeByIP(dst); known && targetOrg != org {
+		return false
+	}
+	for owner, prefix := range policy.reservations {
+		if owner != org && prefix.Contains(dst) {
+			return false
+		}
 	}
 	return policy.allows(groupID, dst)
 }

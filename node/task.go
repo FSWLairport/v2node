@@ -93,13 +93,13 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	if c.dgServer != nil {
 		if newU != nil {
 			// 找出被删除的用户，移除其设备和 WG peer
-			newMap := make(map[int]struct{}, len(newU))
+			newMap := make(map[int]panel.UserInfo, len(newU))
 			removedCount := 0
 			for _, u := range newU {
-				newMap[u.Id] = struct{}{}
+				newMap[u.Id] = u
 			}
 			for _, u := range c.userList {
-				if _, exists := newMap[u.Id]; !exists {
+				if next, exists := newMap[u.Id]; !exists || next.OrgID != u.OrgID || next.GroupID != u.GroupID || next.DGDeviceID != u.DGDeviceID || next.WGStaticPub != u.WGStaticPub {
 					c.dgServer.RemoveUser(u.Id)
 					removedCount++
 				}
