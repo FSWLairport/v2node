@@ -15,7 +15,6 @@ import (
 // dg_settings.routes: routes only tell the client what to send into the tunnel,
 // while the ACL decides what the node is willing to forward once it arrives.
 type DGACL struct {
-	OrgID   int         `json:"org_id"`
 	Default string      `json:"default"`
 	Rules   []DGACLRule `json:"rules"`
 }
@@ -38,20 +37,24 @@ type aclRule struct {
 }
 
 type networkACL struct {
-	org          int
 	rules        []aclRule
 	defaultAllow bool
 }
 
-// aclPolicy holds the compiled per-network policies. A nil *aclPolicy means
-// fail closed; customer isolation applies even to allow-all networks.
+// aclPolicy holds the compiled per-network policies. The zero value fails
+// closed; customer isolation applies even to allow-all networks.
 type aclPolicy struct {
 	networks     map[int]networkACL
+	orgs         map[int]int // network -> customer, from network_orgs
 	reservations map[int]netip.Prefix
+	// singleTenant is a panel without customers (stock v2board): every network
+	// is one customer and a network without an ACL entry is unfiltered.
+	singleTenant bool
 }
 
-// newACLPolicy always enforces trusted scope and tenant isolation.
-func newACLPolicy(acl map[string]DGACL, tenantPools ...map[string]string) *aclPolicy {
+// newACLPolicy compiles the panel's ACL; see isSingleTenant for panels
+// without customers.
+func newACLPolicy(acl map[string]DGACL, networkOrgs map[string]int, tenantPools map[string]string) *aclPolicy {
 	networks := make(map[int]networkACL, len(acl))
 
 	for groupStr, cfg := range acl {
@@ -85,30 +88,33 @@ func newACLPolicy(acl map[string]DGACL, tenantPools ...map[string]string) *aclPo
 			rules = append(rules, aclRule{prefix: prefix.Masked(), allow: allow})
 		}
 
-		networks[groupID] = networkACL{org: cfg.OrgID, rules: rules, defaultAllow: defaultAllow}
+		networks[groupID] = networkACL{rules: rules, defaultAllow: defaultAllow}
 		log.Infof("[DynamicGuard] ACL network=%d default=%s rules=%d", groupID, cfg.Default, len(rules))
 	}
 
-	p := &aclPolicy{networks: networks, reservations: map[int]netip.Prefix{}}
-	for _, pools := range tenantPools {
-		for org, cidr := range pools {
-			id, err := strconv.Atoi(org)
-			prefix, pe := netip.ParsePrefix(cidr)
-			if err != nil || pe != nil || id <= 0 {
-				return &aclPolicy{}
-			}
-			p.reservations[id] = prefix.Masked()
+	p := &aclPolicy{networks: networks, orgs: map[int]int{}, reservations: map[int]netip.Prefix{}, singleTenant: isSingleTenant(networkOrgs, tenantPools)}
+	for group, org := range networkOrgs {
+		if id, err := strconv.Atoi(group); err == nil && org > 0 {
+			p.orgs[id] = org
 		}
+	}
+	for org, cidr := range tenantPools {
+		id, err := strconv.Atoi(org)
+		prefix, pe := netip.ParsePrefix(cidr)
+		if err != nil || pe != nil || id <= 0 {
+			return &aclPolicy{}
+		}
+		p.reservations[id] = prefix.Masked()
 	}
 	return p
 }
 
 // allows reports whether a client of the given network may reach dst.
-// Missing network policy denies access.
+// Missing network policy denies access unless the panel has no customers.
 func (p *aclPolicy) allows(groupID int, dst netip.Addr) bool {
 	n, ok := p.networks[groupID]
 	if !ok {
-		return false
+		return p.singleTenant
 	}
 	for i := range n.rules {
 		if n.rules[i].prefix.Contains(dst) {
@@ -146,7 +152,7 @@ func newACLTUN(inner tun.Device, devices *DeviceTable, policy *aclPolicy, access
 // SetPolicy swaps the whole policy atomically; the data path never locks.
 func (a *aclTUN) SetPolicy(p *aclPolicy) {
 	if p == nil {
-		p = newACLPolicy(nil)
+		p = &aclPolicy{}
 	}
 	a.policy.Store(p)
 }
@@ -210,15 +216,16 @@ func (a *aclTUN) permit(policy *aclPolicy, buf []byte, offset int) bool {
 	// The source address is the peer's tunnel IP, so its lease tells us which
 	// network the packet belongs to. An address with no lease has no network
 	// and is denied rather than sent through unfiltered.
-	org, groupID, known := a.devices.ScopeByIP(src)
-	if !known || org <= 0 {
+	groupID, known := a.devices.GroupIDByIP(src)
+	if !known {
 		return false
 	}
-	scope, ok := policy.networks[groupID]
-	if !ok || scope.org != org {
+	// The customer follows from the leased network, never from the packet.
+	org, owned := policy.orgs[groupID]
+	if !owned && !policy.singleTenant {
 		return false
 	}
-	if targetOrg, _, known := a.devices.ScopeByIP(dst); known && targetOrg != org {
+	if targetGroup, known := a.devices.GroupIDByIP(dst); known && policy.orgs[targetGroup] != org {
 		return false
 	}
 	for owner, prefix := range policy.reservations {

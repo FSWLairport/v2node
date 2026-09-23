@@ -10,7 +10,7 @@ func TestTenantPoolScenarios(t *testing.T) {
 	settings := &DGSettings{
 		IPPools:     map[string]string{"1": "10.0.0.0/24", "2": "10.0.0.64/26", "3": "10.0.0.64/27"},
 		TenantPools: map[string]string{"2": "10.0.0.64/26", "3": "10.0.0.128/26"},
-		ACL:         map[string]DGACL{"1": {OrgID: 1}, "2": {OrgID: 2}, "3": {OrgID: 2}},
+		NetworkOrgs: map[string]int{"1": 1, "2": 2, "3": 2},
 	}
 	pools, _, err := buildIPPools(settings)
 	if err != nil {
@@ -61,7 +61,7 @@ func TestTenantPoolScenarios(t *testing.T) {
 }
 
 func TestEntireNodeReservationAndLeaseReuse(t *testing.T) {
-	settings := &DGSettings{IPPools: map[string]string{"1": "10.0.0.0/29", "2": "10.0.0.0/29", "3": "10.0.0.0/29"}, TenantPools: map[string]string{"2": "10.0.0.0/29"}, ACL: map[string]DGACL{"1": {OrgID: 1}, "2": {OrgID: 2}, "3": {OrgID: 2}}}
+	settings := &DGSettings{IPPools: map[string]string{"1": "10.0.0.0/29", "2": "10.0.0.0/29", "3": "10.0.0.0/29"}, TenantPools: map[string]string{"2": "10.0.0.0/29"}, NetworkOrgs: map[string]int{"1": 1, "2": 2, "3": 2}}
 	pools, _, err := buildIPPools(settings)
 	if err != nil {
 		t.Fatal(err)
@@ -87,16 +87,13 @@ func TestEntireNodeReservationAndLeaseReuse(t *testing.T) {
 }
 
 func TestACLTenantIsolationPrecedesAllowRules(t *testing.T) {
+	// The customer follows from the leased network: 1 and 3 belong to customer 1.
 	dt := leaseTable(t, map[string]int{"10.0.0.2": 1, "10.0.0.3": 2, "10.0.0.4": 3})
-	// Use the table lock when changing the test fixture's trusted identity.
-	dt.mu.Lock()
-	dt.byIP[netip.MustParseAddr("10.0.0.3")].OrgID = 2
-	dt.mu.Unlock()
 	policy := newACLPolicy(map[string]DGACL{
-		"1": {OrgID: 1, Default: "allow"},
-		"2": {OrgID: 2, Default: "allow"},
-		"3": {OrgID: 1, Default: "deny", Rules: []DGACLRule{{Action: "allow", CIDR: "192.168.1.0/24"}}},
-	}, map[string]string{"2": "10.0.1.0/24"})
+		"1": {Default: "allow"},
+		"2": {Default: "allow"},
+		"3": {Default: "deny", Rules: []DGACLRule{{Action: "allow", CIDR: "192.168.1.0/24"}}},
+	}, map[string]int{"1": 1, "2": 2, "3": 1}, map[string]string{"2": "10.0.1.0/24"})
 	inner := &fakeTUN{}
 	a := newACLTUN(inner, dt, policy, false)
 	writeAll(t, a,
@@ -108,8 +105,43 @@ func TestACLTenantIsolationPrecedesAllowRules(t *testing.T) {
 		v4Packet("10.0.0.99", "8.8.8.8"), // unknown source
 	)
 	wantDsts(t, inner, "8.8.8.8", "192.168.1.9")
-	// A credential's customer must agree with the network's owner.
-	policy.networks[1] = networkACL{org: 2, defaultAllow: true}
+	// A network the panel assigned to no customer is denied.
+	delete(policy.orgs, 1)
 	writeAll(t, a, v4Packet("10.0.0.2", "8.8.8.8"))
 	wantDsts(t, inner, "8.8.8.8", "192.168.1.9")
+}
+
+func TestSingleTenantPanel(t *testing.T) {
+	// Stock v2board: no network_orgs, no tenant_pools, ACL for some networks only.
+	s := &DGSettings{
+		IPPools: map[string]string{"1": "10.0.0.0/24", "2": "10.0.0.0/24"},
+		ACL:     map[string]DGACL{"1": {Default: "deny"}},
+	}
+	if _, _, err := buildIPPools(s); err != nil {
+		t.Fatal(err)
+	}
+	dt := leaseTable(t, map[string]int{"10.0.0.2": 1, "10.0.0.3": 2})
+	inner := &fakeTUN{}
+	a := newACLTUN(inner, dt, newACLPolicy(s.ACL, s.NetworkOrgs, s.TenantPools), false)
+	writeAll(t, a,
+		v4Packet("10.0.0.2", "8.8.8.8"),  // configured ACL still applies
+		v4Packet("10.0.0.3", "10.0.0.2"), // no ACL entry: unfiltered
+		v4Packet("10.0.0.99", "8.8.8.8"), // unknown source
+	)
+	wantDsts(t, inner, "10.0.0.2")
+
+	// Customer reservations make the panel multi-tenant, so owners are required.
+	s.TenantPools = map[string]string{"1": "10.0.0.0/25"}
+	if _, _, err := buildIPPools(s); err == nil {
+		t.Fatal("tenant_pools without network_orgs accepted")
+	}
+	// A multi-tenant node with a grant but no attached network yet still starts.
+	if _, _, err := buildIPPools(&DGSettings{TenantPools: s.TenantPools}); err != nil {
+		t.Fatal(err)
+	}
+	// Once customers exist, every network needs an owner.
+	strict := &DGSettings{IPPools: map[string]string{"2": "10.0.0.0/24"}, NetworkOrgs: map[string]int{"1": 3}}
+	if _, _, err := buildIPPools(strict); err == nil {
+		t.Fatal("network without owner accepted")
+	}
 }

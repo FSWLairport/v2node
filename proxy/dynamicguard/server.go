@@ -20,6 +20,7 @@ type DGSettings struct {
 	ServerWGKeyPath   string            `json:"server_wg_key_path"`
 	ServerWGPublicKey string            `json:"server_wg_public_key"`
 	LeaseTTL          uint32            `json:"lease_ttl"`
+	NetworkOrgs       map[string]int    `json:"network_orgs"` // group_id(string) -> org; empty together with tenant_pools means a panel without customers
 	TenantPools       map[string]string `json:"tenant_pools"` // org -> reserved CIDR, including tenants without attached networks
 	IPPools           map[string]string `json:"ip_pools"`     // group_id(string) -> CIDR
 	// Routes 只是客户端分流配置（哪些目标送进隧道），服务端不据此过滤。
@@ -125,6 +126,9 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 	if err != nil {
 		return nil, err
 	}
+	if isSingleTenant(settings.NetworkOrgs, settings.TenantPools) {
+		log.Info("[DynamicGuard] panel sent no customers, running as a single tenant")
+	}
 
 	// 绑定 UDP 端口
 	udpAddr, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
@@ -216,7 +220,7 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		Prefixes:    ipPrefixes,
 		Params:      awgParams,
 		DeviceTable: deviceTable,
-		ACL:         newACLPolicy(settings.ACL, settings.TenantPools),
+		ACL:         newACLPolicy(settings.ACL, settings.NetworkOrgs, settings.TenantPools),
 
 		AccessLogEnabled: cfg.AccessLogEnabled,
 	})

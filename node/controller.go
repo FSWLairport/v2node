@@ -121,6 +121,7 @@ func (c *Controller) startDynamicGuard(node *panel.NodeInfo) error {
 		"ip_pool_count":  len(dgSettings.IPPools),
 		"route_count":    len(dgSettings.Routes),
 		"acl_networks":   len(dgSettings.ACL),
+		"network_orgs":   len(dgSettings.NetworkOrgs),
 		"cookie_enabled": dgSettings.CookieEnabled,
 		"pow_difficulty": dgSettings.PowDifficulty,
 		"mtu":            dgSettings.MTU,
@@ -134,6 +135,7 @@ func (c *Controller) startDynamicGuard(node *panel.NodeInfo) error {
 			ServerWGPublicKey: dgSettings.ServerWGPublicKey,
 			LeaseTTL:          dgSettings.LeaseTTL,
 			IPPools:           dgSettings.IPPools,
+			NetworkOrgs:       dgSettings.NetworkOrgs,
 			TenantPools:       dgSettings.TenantPools,
 			Routes:            dgSettings.Routes,
 			ACL:               dgSettings.ACL,
@@ -180,7 +182,6 @@ func (c *Controller) updateDGUsers(dgServer *dynamicguard.DGServer) {
 			DeviceLimit: u.DeviceLimit,
 			SpeedLimit:  u.SpeedLimit,
 			GroupID:     u.GroupID,
-			OrgID:       u.OrgID,
 		}
 		if u.DGDeviceID != "" || u.WGStaticPub != "" {
 			if err := entry.Pin(u.DGDeviceID, u.WGStaticPub); err != nil {

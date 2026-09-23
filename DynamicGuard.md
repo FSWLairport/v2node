@@ -159,36 +159,86 @@ SHA256(user_key || device_id || client_eph_pub || wg_static_pub || client_nonce)
 
 ## 6. 地址池、路由与访问控制
 
-`ip_pools` 以全局唯一 Network ID（`group_id`）为键。每个 Network 是一份池视图，所有
-视图在当前 DG 节点内共用地址占用记录和分配锁，因此相等、包含或部分重叠的范围都不会
-重复发地址。独立 DG 进程不共享租约；多个 DG 服务同一 Network 时应规划各自地址段，
-切换节点不保证 IP 不变。
+### 6.1 面板下发字段
 
-`tenant_pools` 以客户 `org_id` 为键，携带该节点全部客户保留段，包含未挂载 Network
-的客户；保留段在客户之间必须互不重叠。客户有保留段时，自己的 Network 池必须在段内；
-没有保留段时继承节点池，不能自行切段。每个视图排除其他客户的保留段，即使保留段等于
-整个节点池，也不能给其他客户发地址。同客户 Network 段允许重叠，共享容量而非独占配额。
-只有根池在隧道接口上绑定 `网络地址+1` 网关，该地址在共享占用记录中保留。
+v2node 从节点配置 `dg_settings` 与用户名单取得以下信息，全部以面板为可信来源：
 
-`acl[network_id].org_id` 声明 Network 的客户归属；节点用户名单同时携带 `org_id`、
-`group_id`、凭据和设备公钥 pin。转发包的身份来自已认证租约，WireGuard 的源地址约束
-把包绑定到设备；客户端不能通过包内容选择客户或 Network。未知来源、缺失策略、客户
-与 Network 归属不匹配全部拒绝。其他客户的活跃租约地址和保留段先行拒绝，随后才匹配
-本 Network 的有序目标 CIDR 规则。允许全部目标也不会关闭这层客户隔离，格式损坏的
-规则使该 Network 拒绝转发。
+| 字段 | 键 | 值 | 必需 |
+| --- | --- | --- | --- |
+| `ip_pools` | Network ID（`group_id`） | CIDR | 是 |
+| `network_orgs` | Network ID | 客户 `org_id` | 多租户面板必需 |
+| `tenant_pools` | 客户 `org_id` | 保留 CIDR | 否，仅多租户 |
+| `acl` | Network ID | `default` 与有序 `rules` | 否 |
+| 用户名单 | 用户 | `group_id`、凭据、设备 pin | 是 |
 
-客户端 `routes` 只决定入口流量、系统路由及偏好；ACL 仅在节点执行，不下发客户端，也
-不把不同 Network 的允许规则合并。客户 LAN 若共享相同目标前缀及主机路由表，仍需
-主机侧独立路由域；这层隔离不替代 VRF/namespace。`allowed_ips` 不是 sing-box
-DynamicGuard JSON 字段，旧配置应改用 `routes`。
+Network 的客户归属只由 `network_orgs` 声明；`acl` 只描述出网策略，用户名单不携带客户。
+租约属于哪个客户，由该租约所在 Network 查 `network_orgs` 得出。
 
-升级先更新面板投影，再更新节点：新节点要求配置含客户归属。配置变化仍触发节点重载，
-内存租约随之重建。用户名单中的客户、Network 或设备 pin 变化会先拆除旧 peer。
-VIP 准入由面板过滤凭据名单，节点不从客户端接收“VIP”声明。
+### 6.2 地址池
 
-目前同一设备在多个 Network 中仍使用一个 WireGuard 公钥；同一 DG 的唯一公钥约束
-禁止该公钥同时注册到多个凭据。多 Network 并行场景应使用不同设备身份，同一设备的
-并行接入需要后续身份协议改造，不能通过放宽公钥 pin 解决。
+每个 Network 是一份池视图，所有视图在当前 DG 节点内共用地址占用记录和分配锁，因此
+相等、包含或部分重叠的范围都不会重复发地址；同客户 Network 段允许重叠，共享容量而非
+独占配额。只有根池在隧道接口上绑定 `网络地址+1` 网关，该地址在共享占用记录中保留。
+独立 DG 进程不共享租约；多个 DG 服务同一 Network 时应规划各自地址段，切换节点不保证
+IP 不变。
+
+`tenant_pools` 携带该节点全部客户保留段，包含未挂载 Network 的客户；保留段在客户之间
+必须互不重叠。客户有保留段时，自己的 Network 池必须在段内；没有保留段时继承节点池，
+不能自行切段。每个视图排除其他客户的保留段，即使保留段等于整个节点池，也不能给其他
+客户发地址。
+
+### 6.3 客户隔离与 ACL
+
+节点按 `network_orgs` 与 `tenant_pools` 是否都为空区分两种面板：
+
+- **多租户面板**（saikyo-connect-dashboard，两者至少一项非空）：`ip_pools` 的每个
+  Network 都必须在 `network_orgs` 中有正数客户，否则节点启动失败。转发时，其他客户的
+  活跃租约地址和保留段先行拒绝，随后才匹配本 Network 的有序目标 CIDR 规则；允许全部
+  目标也不会关闭这层客户隔离。未知来源、无归属 Network、缺少 `acl` 条目全部拒绝。
+- **单租户面板**（原版 v2board，两者都不下发）：整个节点视为一个客户，没有跨客户隔离。
+  有 `acl` 条目的 Network 照常执行规则，没有条目的 Network 不过滤，未知来源仍然拒绝。
+
+多租户面板若把两项都漏发，节点会按单租户运行，这一点由面板侧契约测试保证。
+
+转发包的身份来自已认证租约，WireGuard 的源地址约束把包绑定到设备；客户端不能通过包
+内容选择客户或 Network。`default` 与 `action` 只认 `allow`/`deny`，其他值按 deny 处理；
+格式损坏的 CIDR 规则使该 Network 拒绝转发。ACL 仅在节点执行，不下发客户端，也不把
+不同 Network 的规则合并。客户 LAN 若共享相同目标前缀及主机路由表，仍需主机侧独立
+路由域；这层隔离不替代 VRF/namespace。
+
+### 6.4 客户端路由
+
+客户端 `routes` 控制入口流量的目标范围、系统路由及路由偏好，不是服务端授权策略。
+内部 WireGuard peer 的 AllowedIPs 固定覆盖 IPv4/IPv6 默认路由，使 sing-box 显式选择该
+endpoint 作为下一跳时可以访问任意目标，能否到达由节点 ACL 决定。
+
+`system` 模式下的路由分两层，照搬 wg-quick 与上游 sing-box 各自的做法：
+
+- 系统路由只来自 `routes`，逐条安装，等同 wg-quick 对每条非 `/0` AllowedIP 的处理：
+  Linux 写入 main 表，macOS 写入非 scoped 路由，Windows 写入 metric 0 的接口路由。
+  内核已有路由的前缀（本机 WAN/LAN、握手分配地址所在网段）跳过并告警，不替换；
+  Windows 上别的接口已有同前缀也视为已有路由。
+  `routes` 为空则不安装任何系统路由；`/0` 前缀不会被安装，整机全隧道应由 `tun` 入站的
+  `auto_route` 配合路由规则完成。
+- 下一跳能力不依赖系统路由：AllowedIPs 的默认路由只放在绑定到该接口的 socket 才会选中的
+  位置（Linux 私有路由表，macOS IFSCOPE 路由，Windows metric 9999 的接口默认路由），
+  所以路由规则可以把任意域名或地址指向该 endpoint，系统自己的默认路由不受影响。
+- system 模式请开启 `route.auto_detect_interface`，或给 endpoint 配 `bind_interface` /
+  `detour`，把外层 UDP socket 钉在物理网卡上。否则服务器地址若落在 `routes` 内，外层
+  流量会被路由进隧道自身；启动时两者都没配会打告警，不做静默兜底。
+
+`allowed_ips` 不是 sing-box DynamicGuard JSON 字段，旧配置应迁移到 `routes`，不能将两者
+理解为相同的授权含义。
+
+### 6.5 变更与限制
+
+多租户部署先更新面板投影，再更新节点。配置变化触发节点重载，内存租约随之重建；用户
+名单中的 Network 或设备 pin 变化会先拆除旧 peer。VIP 准入由面板过滤凭据名单，节点不从
+客户端接收“VIP”声明。
+
+目前同一设备在多个 Network 中仍使用一个 WireGuard 公钥；同一 DG 的唯一公钥约束禁止
+该公钥同时注册到多个凭据。多 Network 并行场景应使用不同设备身份，同一设备的并行接入
+需要后续身份协议改造，不能通过放宽公钥 pin 解决。
 
 ## 7. 租约、断开与恢复
 
@@ -273,10 +323,10 @@ Pong 可达仅表示控制入口可达，不是 WireGuard peer 或隧道数据�
 | --- | --- |
 | server/server_port、servers | 至少提供一种；地址需要非零 UDP 端口 |
 | user_key、server_public_key | Base64 编码的 32 字节值 |
-| routes | 可选 CIDR 列表，默认空 |
+| routes | 可选 CIDR 列表，默认空；system 模式下逐条装为系统路由，`/0` 不装 |
 | state_path | 可选设备状态 JSON 路径 |
 | private_key、device_id | 显式身份覆盖，分别为 Base64 与十六进制 |
-| system、name | 系统 TUN 模式及接口名；移动端强制用户态模式 |
+| system、name | 系统 TUN 模式及接口名；移动端强制用户态模式，路由行为见 6.4 节 |
 | mtu | 默认 1408 |
 | workers | 工作线程数；移动端有平台默认上限 |
 | persistent_keepalive_interval | 秒，默认 0，建议 25 |
@@ -332,7 +382,8 @@ replace github.com/sagernet/wireguard-go => ./third_party/wireguard-go
 
 两端协议编码检查涵盖 ClientInit MAC、Cookie/PoW、IPv4/IPv6 ServerReply 参数和 Ping/Pong。
 客户端回归测试另外覆盖同 socket Cookie 往返、挑战次数、取消、PoW 上限、故障观察及
-隧道重建。服务端检查配置中的 PoW 难度上限，并回归共享出口保留段、同客户重叠 Network 分配、多节点独立租约及 allow-all 下的客户隔离。
+隧道重建。服务端检查配置中的 PoW 难度上限，并回归共享出口保留段、同客户重叠 Network
+分配、多节点独立租约、allow-all 下的客户隔离及单租户面板的放行与拒绝边界。
 
 这些检查不替代真实网络环境中的路由、MTU、NAT、ACL、系统 TUN 和吞吐测试。当前凭据
 明文传输等协议设计边界沿用原行为；WireGuard 数据面加密与控制面的凭据设计应分别评估。

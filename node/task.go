@@ -99,7 +99,7 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 				newMap[u.Id] = u
 			}
 			for _, u := range c.userList {
-				if next, exists := newMap[u.Id]; !exists || next.OrgID != u.OrgID || next.GroupID != u.GroupID || next.DGDeviceID != u.DGDeviceID || next.WGStaticPub != u.WGStaticPub {
+				if next, exists := newMap[u.Id]; !exists || next.GroupID != u.GroupID || next.DGDeviceID != u.DGDeviceID || next.WGStaticPub != u.WGStaticPub {
 					c.dgServer.RemoveUser(u.Id)
 					removedCount++
 				}

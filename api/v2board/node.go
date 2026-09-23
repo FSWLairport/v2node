@@ -79,12 +79,16 @@ type CommonNode struct {
 }
 
 type DGNodeSettings struct {
-	ServerWGKeyPath   string            `json:"server_wg_key_path"`
-	ServerWGPublicKey string            `json:"server_wg_public_key"`
-	LeaseTTL          uint32            `json:"lease_ttl"`
-	TenantPools       map[string]string `json:"tenant_pools"`
-	IPPools           map[string]string `json:"ip_pools"`
-	Routes            []string          `json:"routes"`
+	ServerWGKeyPath   string `json:"server_wg_key_path"`
+	ServerWGPublicKey string `json:"server_wg_public_key"`
+	LeaseTTL          uint32 `json:"lease_ttl"`
+	// NetworkOrgs maps each network id to its customer. Panels without
+	// customers (stock v2board) leave it and TenantPools out; the node is then
+	// one customer.
+	NetworkOrgs map[string]int    `json:"network_orgs"`
+	TenantPools map[string]string `json:"tenant_pools"`
+	IPPools     map[string]string `json:"ip_pools"`
+	Routes      []string          `json:"routes"`
 	// ACL is the server-enforced egress policy, keyed by network id exactly
 	// like ip_pools. It is never forwarded to clients.
 	ACL           map[string]dynamicguard.DGACL `json:"acl"`

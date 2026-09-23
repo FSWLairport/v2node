@@ -7,6 +7,13 @@ import (
 	"sync"
 )
 
+// isSingleTenant reports a panel without customers (stock v2board): it sends
+// neither network_orgs nor tenant_pools, and the node is then one customer.
+// Anything customer-shaped keeps the strict mode.
+func isSingleTenant(networkOrgs map[string]int, tenantPools map[string]string) bool {
+	return len(networkOrgs) == 0 && len(tenantPools) == 0
+}
+
 func buildIPPools(settings *DGSettings) (map[int]*IPPool, map[string]*IPPool, error) {
 	pools := map[int]*IPPool{}
 	roots := map[string]*IPPool{}
@@ -26,22 +33,23 @@ func buildIPPools(settings *DGSettings) (map[int]*IPPool, map[string]*IPPool, er
 		}
 		reservations[id] = prefix.Masked()
 	}
+	singleTenant := isSingleTenant(settings.NetworkOrgs, settings.TenantPools)
 	for group, cidr := range settings.IPPools {
 		id, err := strconv.Atoi(group)
-		cfg, ok := settings.ACL[group]
-		if err != nil || id <= 0 || !ok || cfg.OrgID <= 0 {
-			return nil, nil, fmt.Errorf("missing trusted owner for network %q", group)
+		org := settings.NetworkOrgs[group]
+		if err != nil || id <= 0 || (!singleTenant && org <= 0) {
+			return nil, nil, fmt.Errorf("missing network_orgs owner for network %q", group)
 		}
 		pool, err := NewIPPool(cidr)
 		if err != nil {
 			return nil, nil, err
 		}
 		pool.mu, pool.used = mu, used
-		if own, ok := reservations[cfg.OrgID]; ok && (!own.Contains(pool.network.Addr()) || pool.network.Bits() < own.Bits()) {
+		if own, ok := reservations[org]; ok && (!own.Contains(pool.network.Addr()) || pool.network.Bits() < own.Bits()) {
 			return nil, nil, fmt.Errorf("network %s outside tenant pool", group)
 		}
-		for org, prefix := range reservations {
-			if org != cfg.OrgID {
+		for owner, prefix := range reservations {
+			if owner != org {
 				pool.ReservePrefix(prefix)
 			}
 		}
