@@ -139,6 +139,7 @@ func (c *Controller) startDynamicGuard(node *panel.NodeInfo) error {
 			TenantPools:       dgSettings.TenantPools,
 			Routes:            dgSettings.Routes,
 			ACL:               dgSettings.ACL,
+			NodeACL:           dgSettings.NodeACL,
 			CookieEnabled:     dgSettings.CookieEnabled,
 			PowDifficulty:     dgSettings.PowDifficulty,
 			MTU:               dgSettings.MTU,

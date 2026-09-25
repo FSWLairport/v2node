@@ -119,7 +119,7 @@ func strictPolicy(acl map[string]DGACL) *aclPolicy {
 	for group := range acl {
 		orgs[group] = 1
 	}
-	return newACLPolicy(acl, orgs, nil)
+	return newACLPolicy(acl, nil, orgs, nil)
 }
 
 // TestACLWireShape pins the payload shape the panel sends: "acl" and
@@ -147,7 +147,7 @@ func TestACLWireShape(t *testing.T) {
 		t.Fatalf("network 13 decoded as %+v", settings.ACL["13"])
 	}
 
-	policy := newACLPolicy(settings.ACL, settings.NetworkOrgs, nil)
+	policy := newACLPolicy(settings.ACL, nil, settings.NetworkOrgs, nil)
 	if policy.allows(12, netip.MustParseAddr("169.254.169.254")) {
 		t.Fatal("metadata endpoint allowed for network 12")
 	}
@@ -376,5 +376,33 @@ func TestACLAllAllowedSkipsCopy(t *testing.T) {
 	}
 	if inner.calls == 0 {
 		t.Fatal("inner device never called")
+	}
+}
+
+// The node's table is checked on its own: a network that allows everything
+// cannot widen a node restricted to one range, and a node that allows
+// everything cannot widen a network's deny.
+func TestNodeACLIsCheckedSeparately(t *testing.T) {
+	policy := newACLPolicy(map[string]DGACL{
+		"12": {Default: "allow"},
+		"13": {Default: "allow", Rules: []DGACLRule{{Action: "deny", CIDR: "10.1.2.0/24"}}},
+	}, &DGACL{Default: "deny", Rules: []DGACLRule{{Action: "allow", CIDR: "10.1.0.0/16"}}}, map[string]int{"12": 1, "13": 1}, nil)
+	for _, c := range []struct {
+		group int
+		dst   string
+		want  bool
+	}{
+		{12, "10.1.3.4", true},  // both allow
+		{12, "8.8.8.8", false},  // the network allows, the node does not
+		{13, "10.1.2.3", false}, // the node allows, the network does not
+		{13, "10.1.9.9", true},
+	} {
+		if got := policy.allows(c.group, netip.MustParseAddr(c.dst)); got != c.want {
+			t.Fatalf("network %d to %s: allowed=%v, want %v", c.group, c.dst, got, c.want)
+		}
+	}
+	var settings DGSettings
+	if err := json.Unmarshal([]byte(`{"node_acl": {"default": "deny", "rules": [{"action": "allow", "cidr": "10.1.0.0/16"}]}}`), &settings); err != nil || settings.NodeACL == nil || settings.NodeACL.Rules[0].CIDR != "10.1.0.0/16" {
+		t.Fatalf("node_acl decoded as %+v: %v", settings.NodeACL, err)
 	}
 }

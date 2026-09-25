@@ -93,7 +93,7 @@ func TestACLTenantIsolationPrecedesAllowRules(t *testing.T) {
 		"1": {Default: "allow"},
 		"2": {Default: "allow"},
 		"3": {Default: "deny", Rules: []DGACLRule{{Action: "allow", CIDR: "192.168.1.0/24"}}},
-	}, map[string]int{"1": 1, "2": 2, "3": 1}, map[string]string{"2": "10.0.1.0/24"})
+	}, nil, map[string]int{"1": 1, "2": 2, "3": 1}, map[string]string{"2": "10.0.1.0/24"})
 	inner := &fakeTUN{}
 	a := newACLTUN(inner, dt, policy, false)
 	writeAll(t, a,
@@ -122,7 +122,7 @@ func TestSingleTenantPanel(t *testing.T) {
 	}
 	dt := leaseTable(t, map[string]int{"10.0.0.2": 1, "10.0.0.3": 2})
 	inner := &fakeTUN{}
-	a := newACLTUN(inner, dt, newACLPolicy(s.ACL, s.NetworkOrgs, s.TenantPools), false)
+	a := newACLTUN(inner, dt, newACLPolicy(s.ACL, s.NodeACL, s.NetworkOrgs, s.TenantPools), false)
 	writeAll(t, a,
 		v4Packet("10.0.0.2", "8.8.8.8"),  // configured ACL still applies
 		v4Packet("10.0.0.3", "10.0.0.2"), // no ACL entry: unfiltered

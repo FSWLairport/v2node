@@ -91,10 +91,13 @@ type DGNodeSettings struct {
 	Routes      []string          `json:"routes"`
 	// ACL is the server-enforced egress policy, keyed by network id exactly
 	// like ip_pools. It is never forwarded to clients.
-	ACL           map[string]dynamicguard.DGACL `json:"acl"`
-	CookieEnabled bool                          `json:"cookie_enabled"`
-	PowDifficulty uint8                         `json:"pow_difficulty"`
-	MTU           int                           `json:"mtu"`
+	ACL map[string]dynamicguard.DGACL `json:"acl"`
+	// NodeACL is the node's own egress policy, checked on its own ahead of
+	// every network's: a packet needs both to allow it. Absent means none.
+	NodeACL       *dynamicguard.DGACL `json:"node_acl,omitempty"`
+	CookieEnabled bool                `json:"cookie_enabled"`
+	PowDifficulty uint8               `json:"pow_difficulty"`
+	MTU           int                 `json:"mtu"`
 }
 
 type SatlsTLS struct {

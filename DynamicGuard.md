@@ -169,6 +169,7 @@ v2node 从节点配置 `dg_settings` 与用户名单取得以下信息，全部�
 | `network_orgs` | Network ID | 客户 `org_id` | 多租户面板必需 |
 | `tenant_pools` | 客户 `org_id` | 保留 CIDR | 否，仅多租户 |
 | `acl` | Network ID | `default` 与有序 `rules` | 否 |
+| `node_acl` | 无（整个节点一份） | `default` 与有序 `rules` | 否 |
 | 用户名单 | 用户 | `group_id`、凭据、设备 pin | 是 |
 
 Network 的客户归属只由 `network_orgs` 声明；`acl` 只描述出网策略，用户名单不携带客户。
@@ -203,7 +204,12 @@ IP 不变。
 转发包的身份来自已认证租约，WireGuard 的源地址约束把包绑定到设备；客户端不能通过包
 内容选择客户或 Network。`default` 与 `action` 只认 `allow`/`deny`，其他值按 deny 处理；
 格式损坏的 CIDR 规则使该 Network 拒绝转发。ACL 仅在节点执行，不下发客户端，也不把
-不同 Network 的规则合并。客户 LAN 若共享相同目标前缀及主机路由表，仍需主机侧独立
+不同 Network 的规则合并。
+
+`node_acl` 是节点自身的出网策略，与各 Network 的 `acl` 分开判断：客户隔离之后，包必须
+先被 `node_acl` 放行、再被所在 Network 的 `acl` 放行才转发，任一张表拒绝即丢弃；两张表
+各自按“第一条命中的规则决定”匹配，不会拼成一张。未下发 `node_acl` 表示节点不另加限制；
+它的格式损坏同样使整个节点拒绝转发。客户 LAN 若共享相同目标前缀及主机路由表，仍需主机侧独立
 路由域；这层隔离不替代 VRF/namespace。
 
 ### 6.4 客户端路由

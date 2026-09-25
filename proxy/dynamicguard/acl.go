@@ -44,7 +44,9 @@ type networkACL struct {
 // aclPolicy holds the compiled per-network policies. The zero value fails
 // closed; customer isolation applies even to allow-all networks.
 type aclPolicy struct {
-	networks     map[int]networkACL
+	networks map[int]networkACL
+	// node is the node's own table, checked on its own; nil means none.
+	node         *networkACL
 	orgs         map[int]int // network -> customer, from network_orgs
 	reservations map[int]netip.Prefix
 	// singleTenant is a panel without customers (stock v2board): every network
@@ -53,46 +55,23 @@ type aclPolicy struct {
 }
 
 // newACLPolicy compiles the panel's ACL; see isSingleTenant for panels
-// without customers.
-func newACLPolicy(acl map[string]DGACL, networkOrgs map[string]int, tenantPools map[string]string) *aclPolicy {
+// without customers. nodeACL, when present, is the node's own policy and is
+// checked separately from every network's.
+func newACLPolicy(acl map[string]DGACL, nodeACL *DGACL, networkOrgs map[string]int, tenantPools map[string]string) *aclPolicy {
 	networks := make(map[int]networkACL, len(acl))
-
 	for groupStr, cfg := range acl {
 		groupID, err := strconv.Atoi(groupStr)
 		if err != nil {
 			log.Warnf("[DynamicGuard] ACL: skipping non-numeric network key %q", groupStr)
 			continue
 		}
-
-		// Anything other than "allow" is treated as deny: an unrecognised value
-		// must never silently widen access.
-		defaultAllow := cfg.Default == aclActionAllow
-		if cfg.Default != aclActionAllow && cfg.Default != aclActionDeny {
-			log.Warnf("[DynamicGuard] ACL network=%d: unknown default %q, treating as deny", groupID, cfg.Default)
-		}
-
-		rules := make([]aclRule, 0, len(cfg.Rules))
-		for _, r := range cfg.Rules {
-			prefix, err := netip.ParsePrefix(r.CIDR)
-			if err != nil {
-				// The panel validates CIDRs, so this only happens on a
-				// corrupted payload. Deny the whole network rather than dropping a deny rule.
-				log.Errorf("[DynamicGuard] ACL network=%d: invalid CIDR %q, network denied: %v", groupID, r.CIDR, err)
-				rules, defaultAllow = nil, false
-				break
-			}
-			allow := r.Action == aclActionAllow
-			if r.Action != aclActionAllow && r.Action != aclActionDeny {
-				log.Warnf("[DynamicGuard] ACL network=%d: unknown action %q for %s, treating as deny", groupID, r.Action, r.CIDR)
-			}
-			rules = append(rules, aclRule{prefix: prefix.Masked(), allow: allow})
-		}
-
-		networks[groupID] = networkACL{rules: rules, defaultAllow: defaultAllow}
-		log.Infof("[DynamicGuard] ACL network=%d default=%s rules=%d", groupID, cfg.Default, len(rules))
+		networks[groupID] = compileACL("network="+groupStr, cfg)
 	}
-
 	p := &aclPolicy{networks: networks, orgs: map[int]int{}, reservations: map[int]netip.Prefix{}, singleTenant: isSingleTenant(networkOrgs, tenantPools)}
+	if nodeACL != nil {
+		node := compileACL("node", *nodeACL)
+		p.node = &node
+	}
 	for group, org := range networkOrgs {
 		if id, err := strconv.Atoi(group); err == nil && org > 0 {
 			p.orgs[id] = org
@@ -109,19 +88,55 @@ func newACLPolicy(acl map[string]DGACL, networkOrgs map[string]int, tenantPools 
 	return p
 }
 
-// allows reports whether a client of the given network may reach dst.
-// Missing network policy denies access unless the panel has no customers.
-func (p *aclPolicy) allows(groupID int, dst netip.Addr) bool {
-	n, ok := p.networks[groupID]
-	if !ok {
-		return p.singleTenant
+// compileACL turns one panel ACL into its matcher. Anything other than
+// "allow" is treated as deny, and an invalid CIDR denies the whole table: an
+// unrecognised or corrupted value must never silently widen access.
+func compileACL(label string, cfg DGACL) networkACL {
+	defaultAllow := cfg.Default == aclActionAllow
+	if cfg.Default != aclActionAllow && cfg.Default != aclActionDeny {
+		log.Warnf("[DynamicGuard] ACL %s: unknown default %q, treating as deny", label, cfg.Default)
 	}
+	rules := make([]aclRule, 0, len(cfg.Rules))
+	for _, r := range cfg.Rules {
+		prefix, err := netip.ParsePrefix(r.CIDR)
+		if err != nil {
+			// The panel validates CIDRs, so this only happens on a corrupted
+			// payload. Deny the whole table rather than dropping a deny rule.
+			log.Errorf("[DynamicGuard] ACL %s: invalid CIDR %q, denied: %v", label, r.CIDR, err)
+			return networkACL{}
+		}
+		allow := r.Action == aclActionAllow
+		if r.Action != aclActionAllow && r.Action != aclActionDeny {
+			log.Warnf("[DynamicGuard] ACL %s: unknown action %q for %s, treating as deny", label, r.Action, r.CIDR)
+		}
+		rules = append(rules, aclRule{prefix: prefix.Masked(), allow: allow})
+	}
+	log.Infof("[DynamicGuard] ACL %s default=%s rules=%d", label, cfg.Default, len(rules))
+	return networkACL{rules: rules, defaultAllow: defaultAllow}
+}
+
+// permits is one table's verdict: the first rule containing dst decides.
+func (n networkACL) permits(dst netip.Addr) bool {
 	for i := range n.rules {
 		if n.rules[i].prefix.Contains(dst) {
 			return n.rules[i].allow
 		}
 	}
 	return n.defaultAllow
+}
+
+// allows reports whether a client of the given network may reach dst: the
+// node's own table, when there is one, and the network's must both allow it.
+// Missing network policy denies access unless the panel has no customers.
+func (p *aclPolicy) allows(groupID int, dst netip.Addr) bool {
+	if p.node != nil && !p.node.permits(dst) {
+		return false
+	}
+	n, ok := p.networks[groupID]
+	if !ok {
+		return p.singleTenant
+	}
+	return n.permits(dst)
 }
 
 // aclTUN wraps the kernel TUN device and enforces the per-network ACL on the

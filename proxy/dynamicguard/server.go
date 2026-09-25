@@ -27,10 +27,13 @@ type DGSettings struct {
 	Routes []string `json:"routes"`
 	// ACL 是服务端强制的出网策略，按网络（group_id 字符串）区分，绝不做并集，
 	// 也绝不下发给客户端。
-	ACL           map[string]DGACL `json:"acl"`
-	CookieEnabled bool             `json:"cookie_enabled"`
-	PowDifficulty uint8            `json:"pow_difficulty"`
-	MTU           int              `json:"mtu"`
+	ACL map[string]DGACL `json:"acl"`
+	// NodeACL 是节点自身的出网策略，与各网络的 ACL 分开判断：两者都放行才转发。
+	// 缺省表示节点不另加限制。
+	NodeACL       *DGACL `json:"node_acl,omitempty"`
+	CookieEnabled bool   `json:"cookie_enabled"`
+	PowDifficulty uint8  `json:"pow_difficulty"`
+	MTU           int    `json:"mtu"`
 }
 
 // DGServerConfig 服务端完整配置
@@ -220,7 +223,7 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		Prefixes:    ipPrefixes,
 		Params:      awgParams,
 		DeviceTable: deviceTable,
-		ACL:         newACLPolicy(settings.ACL, settings.NetworkOrgs, settings.TenantPools),
+		ACL:         newACLPolicy(settings.ACL, settings.NodeACL, settings.NetworkOrgs, settings.TenantPools),
 
 		AccessLogEnabled: cfg.AccessLogEnabled,
 	})
