@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - master
+      - dev
     paths:
       - "**/*.go"
       - "go.mod"
@@ -84,7 +84,8 @@ jobs:
           # END S390X
           # END Other architectures
       fail-fast: false
-
+    permissions:
+          contents: write
     runs-on: ubuntu-latest
     env:
       GOOS: ${{ matrix.goos }}
@@ -170,6 +171,7 @@ jobs:
       - name: Upload binaries to release
         uses: svenstaro/upload-release-action@v2
         if: github.event_name == 'release'
+        
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: ./v2node-${{ steps.get_filename.outputs.ASSET_NAME }}.zip*
