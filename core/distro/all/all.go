@@ -48,6 +48,7 @@ import (
 	_ "github.com/xtls/xray-core/proxy/trojan"
 	_ "github.com/xtls/xray-core/proxy/tuic"
 
+	_ "github.com/wyx2685/v2node/proxy/satls"
 	_ "github.com/xtls/xray-core/proxy/vless/inbound"
 	_ "github.com/xtls/xray-core/proxy/vless/outbound"
 	_ "github.com/xtls/xray-core/proxy/vmess/inbound"
