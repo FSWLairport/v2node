@@ -133,6 +133,11 @@ type BaseConfig struct {
 	PullInterval           any `json:"pull_interval"`
 	DeviceOnlineMinTraffic int `json:"device_online_min_traffic"`
 	NodeReportMinTraffic   int `json:"node_report_min_traffic"`
+	// AccessLogEnabled makes this node report one record per connection it
+	// carries. The panel sends the key only when it is on, so a node that never
+	// enables it keeps pulling a byte-identical configuration and never reloads
+	// over this feature.
+	AccessLogEnabled bool `json:"access_log_enabled"`
 }
 
 type TlsSettings struct {
@@ -181,6 +186,7 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 		R().
 		SetContext(ctx).
 		SetHeader("If-None-Match", c.nodeEtag).
+		SetHeader("X-Node-Version", RuntimeNodeVersion()).
 		ForceContentType("application/json").
 		Get(path)
 	if err != nil {

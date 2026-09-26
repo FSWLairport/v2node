@@ -70,6 +70,9 @@ func TestGetNodeInfoParsesDashboardSATLSCommonNode(t *testing.T) {
 				if got := r.URL.Query().Get("node_id"); got != "42" {
 					t.Errorf("node_id = %q, want 42", got)
 				}
+				if got := r.Header.Get("X-Node-Version"); got == "" {
+					t.Error("X-Node-Version header was not sent")
+				}
 				if got := r.URL.Query().Get("token"); got != "node-secret" {
 					t.Errorf("token = %q, want node-secret", got)
 				}
@@ -97,6 +100,11 @@ func TestGetNodeInfoParsesDashboardSATLSCommonNode(t *testing.T) {
 			}
 			if node.Common.TlsSettings.ServerName == "" || node.Common.CertInfo == nil {
 				t.Fatalf("TLS settings were not projected: %+v", node.Common)
+			}
+			// The panel sends the access-log switch only when it is on, so its
+			// absence has to parse as off rather than as missing.
+			if node.Common.BaseConfig == nil || node.Common.BaseConfig.AccessLogEnabled != (tt.name == "full") {
+				t.Fatalf("access_log_enabled = %+v, want %v", node.Common.BaseConfig, tt.name == "full")
 			}
 			if node.Common.CertInfo.CertFile != node.Common.TlsSettings.CertFile ||
 				node.Common.CertInfo.KeyFile != node.Common.TlsSettings.KeyFile ||

@@ -1,9 +1,11 @@
 package panel
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -24,6 +26,10 @@ type Client struct {
 	responseBodyHash string
 	UserList         *UserListBody
 	AliveMap         *AliveMap
+	// unsupported remembers the additive report endpoints this panel answered
+	// 404 for, so the node stops posting reports a v2board-style panel has no
+	// route for.
+	unsupported sync.Map
 }
 
 func New(c *conf.NodeConfig) (*Client, error) {
@@ -33,6 +39,10 @@ func New(c *conf.NodeConfig) (*Client, error) {
 		retryCount = *c.RetryCount
 	}
 	client.SetRetryCount(retryCount)
+	if c.Insecure {
+		client.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true})
+		logrus.Warnf("node %d: Insecure=true, panel TLS certificate is not verified", c.NodeID)
+	}
 	client.SetHeader("User-Agent", fmt.Sprintf("v2node go-resty/%s (https://github.com/go-resty/resty)", resty.Version))
 	if c.Timeout > 0 {
 		client.SetTimeout(time.Duration(c.Timeout) * time.Second)
