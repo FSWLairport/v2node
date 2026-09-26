@@ -9,6 +9,11 @@ import (
 )
 
 func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
+	// DynamicGuard 流量上报
+	if c.dgServer != nil {
+		return c.reportDGTraffic(ctx)
+	}
+
 	var reportmin = 0
 	var devicemin = 0
 	if c.info.Common.BaseConfig != nil {
@@ -74,6 +79,33 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 	return nil
 }
 
+func (c *Controller) reportDGTraffic(ctx context.Context) error {
+	dgTraffic := c.dgServer.GetUserTraffic()
+	if len(dgTraffic) == 0 {
+		return nil
+	}
+
+	userTraffic := make([]panel.UserTraffic, 0, len(dgTraffic))
+	for _, t := range dgTraffic {
+		userTraffic = append(userTraffic, panel.UserTraffic{
+			UID:      t.UserID,
+			Upload:   t.Upload,
+			Download: t.Download,
+		})
+	}
+
+	err := c.apiClient.ReportUserTraffic(ctx, userTraffic)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"tag": c.tag,
+			"err": err,
+		}).Info("Report DG user traffic failed")
+	} else {
+		log.WithField("tag", c.tag).Infof("Report %d DG users traffic", len(userTraffic))
+	}
+	return nil
+}
+
 func compareUserList(old, new []panel.UserInfo) (deleted, added, modified []panel.UserInfo) {
 	oldMap := make(map[string]panel.UserInfo, len(old))
 	for _, u := range old {
@@ -84,7 +116,7 @@ func compareUserList(old, new []panel.UserInfo) (deleted, added, modified []pane
 		if o, ok := oldMap[u.Uuid]; !ok {
 			added = append(added, u)
 		} else {
-			if o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit {
+			if o.GroupID != u.GroupID || o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit || o.DGDeviceID != u.DGDeviceID || o.WGStaticPub != u.WGStaticPub {
 				modified = append(modified, u)
 			}
 			delete(oldMap, u.Uuid)
