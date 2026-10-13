@@ -28,7 +28,7 @@ func TestGetNodeInfoParsesDashboardSATLSCommonNode(t *testing.T) {
 				"server_port":443,
 				"routes":[],
  "org_bandwidth_limits":{"7":{"up_mbps":50,"down_mbps":100}},
-				"base_config":{"push_interval":60,"pull_interval":"15","device_online_min_traffic":100,"node_report_min_traffic":100,"access_log_enabled":true},
+				"base_config":{"push_interval":60,"pull_interval":"15","device_online_min_traffic":100,"node_report_min_traffic":100,"access_log_enabled":true,"usage_sampling":true},
 				"tls":1,
 				"tls_settings":{"server_name":"full-tls.edge.example","cert_mode":"file","cert_file":"/run/secrets/full.crt","key_file":"/run/secrets/full.key","reject_unknown_sni":"1"},
 				"satls_settings":{"host":"full-cover.edge.example","mode":"full"}
@@ -96,6 +96,12 @@ func TestGetNodeInfoParsesDashboardSATLSCommonNode(t *testing.T) {
 			}
 			if limits := node.Common.OrgBandwidthLimits[7]; limits.UpMbps != 50 || limits.DownMbps != 100 {
 				t.Fatalf("org limits=%v", node.Common.OrgBandwidthLimits)
+			}
+			if tt.name == "full" && !node.Common.BaseConfig.UsageSampling {
+				t.Fatal("usage sampling capability was dropped")
+			}
+			if tt.name == "split" && node.Common.BaseConfig.UsageSampling {
+				t.Fatal("old panels must retain legacy reporting")
 			}
 			if tt.name == "full" && (node.PushInterval != time.Minute || node.PullInterval != 15*time.Second) {
 				t.Fatalf("full intervals push=%s pull=%s", node.PushInterval, node.PullInterval)

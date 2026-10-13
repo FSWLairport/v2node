@@ -131,6 +131,7 @@ type Route struct {
 }
 
 type BaseConfig struct {
+	UsageSampling          bool `json:"usage_sampling"`
 	NodeEvents             bool `json:"node_events"`
 	PushInterval           any  `json:"push_interval"`
 	PullInterval           any  `json:"pull_interval"`

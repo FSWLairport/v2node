@@ -24,8 +24,12 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		reportmin = c.info.Common.BaseConfig.NodeReportMinTraffic
 		devicemin = c.info.Common.BaseConfig.DeviceOnlineMinTraffic
 	}
+	usageSampling := c.info.Common.BaseConfig != nil && c.info.Common.BaseConfig.UsageSampling
+	if usageSampling {
+		reportmin = 0
+	}
 	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, reportmin)
-	if len(userTraffic) > 0 {
+	if len(userTraffic) > 0 || usageSampling {
 		err = c.apiClient.ReportUserTraffic(ctx, userTraffic)
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -35,7 +39,7 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
-		} else {
+		} else if len(userTraffic) > 0 {
 			log.WithField("tag", c.tag).Infof("Report %d users traffic", len(userTraffic))
 			//log.WithField("tag", c.tag).Debugf("User traffic: %+v", userTraffic)
 		}
@@ -88,7 +92,7 @@ func (c *Controller) reportDGTraffic(ctx context.Context) error {
 	c.reportDGAccessLogs(ctx)
 
 	dgTraffic := c.dgServer.GetUserTraffic()
-	if len(dgTraffic) == 0 {
+	if len(dgTraffic) == 0 && (c.info.Common.BaseConfig == nil || !c.info.Common.BaseConfig.UsageSampling) {
 		return nil
 	}
 
@@ -107,7 +111,7 @@ func (c *Controller) reportDGTraffic(ctx context.Context) error {
 			"tag": c.tag,
 			"err": err,
 		}).Info("Report DG user traffic failed")
-	} else {
+	} else if len(userTraffic) > 0 {
 		log.WithField("tag", c.tag).Infof("Report %d DG users traffic", len(userTraffic))
 	}
 	return nil

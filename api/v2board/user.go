@@ -152,13 +152,16 @@ func (c *Client) ReportUserTraffic(ctx context.Context, userTraffic []UserTraffi
 		data[userTraffic[i].UID] = []int64{userTraffic[i].Upload, userTraffic[i].Download}
 	}
 	const path = "/api/v1/server/UniProxy/push"
-	_, err := c.client.R().
+	r, err := c.client.R().
 		SetContext(ctx).
 		SetBody(data).
 		ForceContentType("application/json").
 		Post(path)
 	if err != nil {
 		return err
+	}
+	if r == nil || r.StatusCode() < 200 || r.StatusCode() >= 300 {
+		return fmt.Errorf("traffic report was rejected")
 	}
 	return nil
 }
