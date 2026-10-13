@@ -18,6 +18,7 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/conn"
 	"github.com/amnezia-vpn/amneziawg-go/device"
 	"github.com/amnezia-vpn/amneziawg-go/tun"
+	"github.com/wyx2685/v2node/common/rate"
 )
 
 // ReceivedPacket 从 UDP 分流后的 WireGuard 报文
@@ -192,6 +193,7 @@ type WGDevice struct {
 	bind   *DGBind
 	// aclDev 是包裹内核 TUN 的那一层，访问日志的流表挂在它上面。
 	aclDev      *aclTUN
+	bandwidth   *bandwidthTUN
 	tunName     string
 	privateKey  [32]byte
 	deviceTable *DeviceTable
@@ -206,14 +208,16 @@ type peerTraffic struct {
 
 // WGDeviceConfig WG 设备配置
 type WGDeviceConfig struct {
-	PrivateKey  [32]byte
-	MTU         int
-	UDPConn     *net.UDPConn
-	TunnelAddrs []netip.Addr   // 各 IP 池的网关地址
-	Prefixes    []netip.Prefix // 各 IP 池的子网前缀（用于路由和 NAT）
-	Params      AmneziaParams  // per-node AmneziaWG 抗 DPI 参数（与下发给客户端的同一组）
-	DeviceTable *DeviceTable   // 按包的源隧道 IP 定位所属网络（ACL 强制用）
-	ACL         *aclPolicy     // 服务端强制的出网策略，nil 表示不过滤
+	NetworkOrgs        map[string]int
+	OrgBandwidthLimits map[int]rate.BandwidthLimit
+	PrivateKey         [32]byte
+	MTU                int
+	UDPConn            *net.UDPConn
+	TunnelAddrs        []netip.Addr   // 各 IP 池的网关地址
+	Prefixes           []netip.Prefix // 各 IP 池的子网前缀（用于路由和 NAT）
+	Params             AmneziaParams  // per-node AmneziaWG 抗 DPI 参数（与下发给客户端的同一组）
+	DeviceTable        *DeviceTable   // 按包的源隧道 IP 定位所属网络（ACL 强制用）
+	ACL                *aclPolicy     // 服务端强制的出网策略，nil 表示不过滤
 	// AccessLogEnabled 打开逐连接记录。关闭时数据面只多一次原子读。
 	AccessLogEnabled bool
 }
@@ -249,7 +253,8 @@ func NewWGDevice(cfg *WGDeviceConfig) (*WGDevice, error) {
 	}
 
 	// 包一层 ACL 过滤：从 peer 解封装后写入内核的方向是客户端出网的必经之路
-	aclDev := newACLTUN(tunDev, cfg.DeviceTable, cfg.ACL, cfg.AccessLogEnabled)
+	bandwidth := newBandwidthTUN(tunDev, cfg.DeviceTable, cfg.NetworkOrgs, cfg.OrgBandwidthLimits)
+	aclDev := newACLTUN(bandwidth, cfg.DeviceTable, cfg.ACL, cfg.AccessLogEnabled)
 
 	// 创建 wireguard-go 设备
 	dev := device.NewDevice(aclDev, bind, wgLogger)
@@ -279,6 +284,7 @@ func NewWGDevice(cfg *WGDeviceConfig) (*WGDevice, error) {
 		device:      dev,
 		bind:        bind,
 		aclDev:      aclDev,
+		bandwidth:   bandwidth,
 		tunName:     tunName,
 		privateKey:  cfg.PrivateKey,
 		deviceTable: nil, // 在 server 初始化后通过 SetDeviceTable 注入

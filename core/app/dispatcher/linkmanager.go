@@ -29,10 +29,14 @@ type LinkManager struct {
 
 func (m *LinkManager) AddLink(writer *ManagedWriter, reader buf.Reader) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if !m.closed {
-		m.links[writer] = reader
+	if m.closed {
+		m.mu.Unlock()
+		common.Close(writer.writer)
+		common.Interrupt(reader)
+		return
 	}
+	m.links[writer] = reader
+	m.mu.Unlock()
 }
 
 func (m *LinkManager) RemoveWriter(writer *ManagedWriter) {

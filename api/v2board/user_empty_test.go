@@ -89,3 +89,29 @@ func TestGetUserListRejectsErrorStatus(t *testing.T) {
 		t.Fatalf("500 response returned a user list: %#v", users)
 	}
 }
+
+func TestGetUserListReadsOrganizationIndependentlyOfNetwork(t *testing.T) {
+	for _, format := range []string{"json", "msgpack"} {
+		t.Run(format, func(t *testing.T) {
+			payload := []byte(`{"users":[{"id":1,"uuid":"a","org_id":7,"group_id":42,"speed_limit":10}]}`)
+			contentType := "application/json"
+			if format == "msgpack" {
+				var err error
+				payload, err = msgpack.Marshal(UserListBody{Users: []UserInfo{{Id: 1, Uuid: "a", OrgID: 7, GroupID: 42, SpeedLimit: 10}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				contentType = "application/x-msgpack"
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", contentType)
+				_, _ = w.Write(payload)
+			}))
+			defer server.Close()
+			users, err := newPanelTestClient(t, server.URL).GetUserList(context.Background())
+			if err != nil || len(users) != 1 || users[0].OrgID != 7 || users[0].GroupID != 42 || users[0].SpeedLimit != 10 {
+				t.Fatalf("users=%v err=%v", users, err)
+			}
+		})
+	}
+}

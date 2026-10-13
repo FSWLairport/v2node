@@ -17,6 +17,7 @@ type Task struct {
 	Running  bool
 	ReloadCh chan struct{}
 	Stop     chan struct{}
+	Wake     <-chan struct{}
 }
 
 func (t *Task) Start(first bool) error {
@@ -42,6 +43,7 @@ func (t *Task) Start(first bool) error {
 			select {
 			case <-timer.C:
 				// continue
+			case <-t.Wake:
 			case <-t.Stop:
 				return
 			}

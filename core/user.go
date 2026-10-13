@@ -11,6 +11,7 @@ import (
 	"github.com/wyx2685/v2node/common/counter"
 	"github.com/wyx2685/v2node/common/format"
 	"github.com/wyx2685/v2node/core/app/dispatcher"
+	"github.com/wyx2685/v2node/limiter"
 	"github.com/wyx2685/v2node/proxy/satls"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
@@ -48,11 +49,16 @@ func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo
 	if err != nil {
 		return fmt.Errorf("get user manager error: %s", err)
 	}
+	userLimit, _ := limiter.GetLimiter(tag)
 	var user string
 	vc.users.mapLock.Lock()
 	defer vc.users.mapLock.Unlock()
 	for i := range users {
 		user = format.UserTag(tag, users[i].Uuid)
+		// Fence new dispatches before closing links; already authenticated SMUX sessions can open more streams.
+		if userLimit != nil {
+			userLimit.UserLimitInfo.Delete(user)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err = userManager.RemoveUser(ctx, user)
 		cancel()
@@ -85,8 +91,9 @@ func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserT
 			up := traffic.UpCounter.Load()
 			down := traffic.DownCounter.Load()
 			if up+down > int64(mintraffic*1000) {
-				traffic.UpCounter.Store(0)
-				traffic.DownCounter.Store(0)
+				// Drain atomically so concurrent forwarding cannot lose bytes.
+				up = traffic.UpCounter.Swap(0)
+				down = traffic.DownCounter.Swap(0)
 				if vc.users.uidMap[email] == 0 {
 					c.Delete(email)
 					return true

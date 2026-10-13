@@ -12,6 +12,7 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/wyx2685/v2node/common/rate"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -38,8 +39,9 @@ type DGSettings struct {
 
 // DGServerConfig 服务端完整配置
 type DGServerConfig struct {
-	ListenAddr string
-	DGSettings *DGSettings
+	OrgBandwidthLimits map[int]rate.BandwidthLimit
+	ListenAddr         string
+	DGSettings         *DGSettings
 	// AccessLogEnabled comes from base_config, not from dg_settings: the panel
 	// offers the same switch for both protocols.
 	AccessLogEnabled bool
@@ -85,6 +87,9 @@ const pingQueueSize = 1024
 
 // NewDGServer 创建 DG 服务端
 func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
+	if err := rate.ValidateBandwidthLimits(cfg.OrgBandwidthLimits); err != nil {
+		return nil, err
+	}
 	settings := cfg.DGSettings
 	if settings.PowDifficulty > 24 {
 		return nil, fmt.Errorf("pow_difficulty must be between 0 and 24")
@@ -216,14 +221,16 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 
 	// 创建 WG 设备（使用内核 TUN，自动配置系统路由和 NAT）
 	wgDevice, err := NewWGDevice(&WGDeviceConfig{
-		PrivateKey:  serverWGPriv,
-		MTU:         settings.MTU,
-		UDPConn:     udpConn,
-		TunnelAddrs: tunnelAddrs,
-		Prefixes:    ipPrefixes,
-		Params:      awgParams,
-		DeviceTable: deviceTable,
-		ACL:         newACLPolicy(settings.ACL, settings.NodeACL, settings.NetworkOrgs, settings.TenantPools),
+		PrivateKey:         serverWGPriv,
+		MTU:                settings.MTU,
+		UDPConn:            udpConn,
+		TunnelAddrs:        tunnelAddrs,
+		Prefixes:           ipPrefixes,
+		Params:             awgParams,
+		DeviceTable:        deviceTable,
+		NetworkOrgs:        settings.NetworkOrgs,
+		OrgBandwidthLimits: cfg.OrgBandwidthLimits,
+		ACL:                newACLPolicy(settings.ACL, settings.NodeACL, settings.NetworkOrgs, settings.TenantPools),
 
 		AccessLogEnabled: cfg.AccessLogEnabled,
 	})
@@ -320,6 +327,9 @@ func (s *DGServer) Start() error {
 func (s *DGServer) UpdateUsers(users []*UserEntry) {
 	oldCount := s.userKeyMap.Len()
 	s.userKeyMap.Update(users)
+	if s.wgDevice != nil && s.wgDevice.bandwidth != nil {
+		s.wgDevice.bandwidth.updateUsers(users)
+	}
 	log.WithFields(log.Fields{
 		"old_users": oldCount,
 		"new_users": len(users),

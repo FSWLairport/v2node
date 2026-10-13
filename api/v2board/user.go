@@ -20,6 +20,7 @@ type OnlineUser struct {
 }
 
 type UserInfo struct {
+	OrgID       int    `json:"org_id,omitempty" msgpack:"org_id,omitempty"`
 	Id          int    `json:"id" msgpack:"id"`
 	Uuid        string `json:"uuid" msgpack:"uuid"`
 	SpeedLimit  int    `json:"speed_limit" msgpack:"speed_limit"`

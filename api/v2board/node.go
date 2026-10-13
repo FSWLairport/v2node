@@ -13,6 +13,7 @@ import (
 
 	"encoding/json"
 
+	"github.com/wyx2685/v2node/common/rate"
 	"github.com/wyx2685/v2node/proxy/dynamicguard"
 )
 
@@ -34,11 +35,12 @@ type NodeInfo struct {
 }
 
 type CommonNode struct {
-	Protocol   string      `json:"protocol"`
-	ListenIP   string      `json:"listen_ip"`
-	ServerPort int         `json:"server_port"`
-	Routes     []Route     `json:"routes"`
-	BaseConfig *BaseConfig `json:"base_config"`
+	OrgBandwidthLimits map[int]rate.BandwidthLimit `json:"org_bandwidth_limits,omitempty"`
+	Protocol           string                      `json:"protocol"`
+	ListenIP           string                      `json:"listen_ip"`
+	ServerPort         int                         `json:"server_port"`
+	Routes             []Route                     `json:"routes"`
+	BaseConfig         *BaseConfig                 `json:"base_config"`
 	//vless vmess trojan
 	Tls                  int         `json:"tls"`
 	TlsSettings          TlsSettings `json:"tls_settings"`
@@ -129,10 +131,11 @@ type Route struct {
 }
 
 type BaseConfig struct {
-	PushInterval           any `json:"push_interval"`
-	PullInterval           any `json:"pull_interval"`
-	DeviceOnlineMinTraffic int `json:"device_online_min_traffic"`
-	NodeReportMinTraffic   int `json:"node_report_min_traffic"`
+	NodeEvents             bool `json:"node_events"`
+	PushInterval           any  `json:"push_interval"`
+	PullInterval           any  `json:"pull_interval"`
+	DeviceOnlineMinTraffic int  `json:"device_online_min_traffic"`
+	NodeReportMinTraffic   int  `json:"node_report_min_traffic"`
 	// AccessLogEnabled makes this node report one record per connection it
 	// carries. The panel sends the key only when it is on, so a node that never
 	// enables it keeps pulling a byte-identical configuration and never reloads
@@ -274,6 +277,9 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	node.PushInterval = intervalToTime(cm.BaseConfig.PushInterval)
 	node.PullInterval = intervalToTime(cm.BaseConfig.PullInterval)
 
+	if err := rate.ValidateBandwidthLimits(cm.OrgBandwidthLimits); err != nil {
+		return nil, err
+	}
 	node.Common = cm
 
 	return node, nil

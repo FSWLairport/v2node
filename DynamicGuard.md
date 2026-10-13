@@ -170,7 +170,14 @@ v2node 从节点配置 `dg_settings` 与用户名单取得以下信息，全部�
 | `tenant_pools` | 客户 `org_id` | 保留 CIDR | 否，仅多租户 |
 | `acl` | Network ID | `default` 与有序 `rules` | 否 |
 | `node_acl` | 无（整个节点一份） | `default` 与有序 `rules` | 否 |
-| 用户名单 | 用户 | `group_id`、凭据、设备 pin | 是 |
+| 用户名单 | 用户 | `group_id`、凭据、设备 pin、`speed_limit` | 是 |
+
+顶层可选的 `org_bandwidth_limits` 按组织 ID 下发上传和下载 Mbps（`up_mbps` / `down_mbps`），
+各方向的 0 表示不限速。数据面从已认证租约的 Network 和 `network_orgs` 确定客户，
+不使用用户列表的 `org_id` 决定 DG 归属；`org_id` 供 SATLS 组织限速使用。
+TUN 双向路径按客户共享令牌桶，超额丢包，不阻塞公共收发循环。
+用户 `speed_limit` 则按凭据共用上下行桶，两层同时生效；用户列表刷新保留未变限额的桶。
+组织带宽属于单个节点，不是跨节点合计流量配额。
 
 Network 的客户归属只由 `network_orgs` 声明；`acl` 只描述出网策略，用户名单不携带客户。
 租约属于哪个客户，由该租约所在 Network 查 `network_orgs` 得出。

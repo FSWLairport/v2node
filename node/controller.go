@@ -7,6 +7,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	panel "github.com/wyx2685/v2node/api/v2board"
 	"github.com/wyx2685/v2node/common/accesslog"
+	"github.com/wyx2685/v2node/common/rate"
 	"github.com/wyx2685/v2node/common/task"
 	"github.com/wyx2685/v2node/conf"
 	"github.com/wyx2685/v2node/core"
@@ -23,6 +24,8 @@ type Controller struct {
 	aliveMap                map[int]int
 	conf                    *conf.NodeConfig
 	info                    *panel.NodeInfo
+	eventsCancel            context.CancelFunc
+	eventsDone              chan struct{}
 	nodeInfoMonitorPeriodic *task.Task
 	userReportPeriodic      *task.Task
 	renewCertPeriodic       *task.Task
@@ -72,6 +75,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 
 	// add limiter
 	l := limiter.AddLimiter(c.info.Type, c.tag, c.userList, c.aliveMap)
+	l.OrgLimiter = rate.NewOrganizationLimiter(node.Common.OrgBandwidthLimits)
 	c.limiter = l
 	if node.Security == panel.Tls {
 		err = c.requestCert()
@@ -128,8 +132,9 @@ func (c *Controller) startDynamicGuard(node *panel.NodeInfo) error {
 	}).Info("Starting DynamicGuard node")
 
 	dgServer, err := dynamicguard.NewDGServer(&dynamicguard.DGServerConfig{
-		ListenAddr:       listenAddr,
-		AccessLogEnabled: c.accessLogEnabled(),
+		ListenAddr:         listenAddr,
+		AccessLogEnabled:   c.accessLogEnabled(),
+		OrgBandwidthLimits: node.Common.OrgBandwidthLimits,
 		DGSettings: &dynamicguard.DGSettings{
 			ServerWGKeyPath:   dgSettings.ServerWGKeyPath,
 			ServerWGPublicKey: dgSettings.ServerWGPublicKey,
@@ -196,6 +201,10 @@ func (c *Controller) updateDGUsers(dgServer *dynamicguard.DGServer) {
 
 // Close implement the Close() function of the service interface
 func (c *Controller) Close() error {
+	if c.eventsCancel != nil {
+		c.eventsCancel()
+		<-c.eventsDone
+	}
 	limiter.DeleteLimiter(c.tag)
 	accesslog.Disable(c.tag)
 	if c.nodeInfoMonitorPeriodic != nil {
