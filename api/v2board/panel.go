@@ -22,6 +22,10 @@ type Client struct {
 	NodeId           int
 	nodeEtag         string
 	userEtag         string
+	userMu           sync.Mutex
+	clockMu          sync.RWMutex
+	serverClock      time.Time
+	localClock       time.Time
 	responseBodyHash string
 	UserList         *UserListBody
 	AliveMap         *AliveMap
@@ -39,6 +43,7 @@ func New(c *conf.NodeConfig) (*Client, error) {
 	}
 	client.SetRetryCount(retryCount)
 	client.SetHeader("User-Agent", fmt.Sprintf("v2node go-resty/%s (https://github.com/go-resty/resty)", resty.Version))
+	client.SetHeader("X-Saikyo-Consumer-Leases", "1")
 	if c.Timeout > 0 {
 		client.SetTimeout(time.Duration(c.Timeout) * time.Second)
 	} else {

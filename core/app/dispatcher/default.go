@@ -10,7 +10,9 @@ import (
 
 	"github.com/wyx2685/v2node/common/accesslog"
 	"github.com/wyx2685/v2node/common/counter"
+	"github.com/wyx2685/v2node/common/grantlimit"
 	"github.com/wyx2685/v2node/common/rate"
+	"github.com/wyx2685/v2node/common/userlease"
 	"github.com/wyx2685/v2node/limiter"
 
 	"github.com/xtls/xray-core/app/dispatcher"
@@ -171,6 +173,13 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 	var limit *limiter.Limiter
 	var err error
 	if user != nil && len(user.Email) > 0 {
+		if !userlease.Allowed(user.Email) {
+			common.Close(outboundLink.Writer)
+			common.Close(inboundLink.Writer)
+			common.Interrupt(outboundLink.Reader)
+			common.Interrupt(inboundLink.Reader)
+			return nil, nil, nil, errors.New("consumer authorization expired")
+		}
 		limit, err = limiter.GetLimiter(sessionInbound.Tag)
 		if err != nil {
 			errors.LogInfo(ctx, "get limiter ", sessionInbound.Tag, " error: ", err)
@@ -192,33 +201,37 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 			common.Interrupt(inboundLink.Reader)
 			return nil, nil, nil, errors.New("Limited ", user.Email, " by conn or ip")
 		}
-		var lm *LinkManager
-		if lmloaded, ok := d.LinkManagers.Load(user.Email); !ok {
-			lm = &LinkManager{
-				links: make(map[*ManagedWriter]buf.Reader),
-			}
-			d.LinkManagers.Store(user.Email, lm)
-		} else {
-			lm = lmloaded.(*LinkManager)
-		}
+		stored, _ := d.LinkManagers.LoadOrStore(user.Email, &LinkManager{links: make(map[*ManagedWriter]buf.Reader)})
+		lm := stored.(*LinkManager)
 		managedWriter := &ManagedWriter{
 			writer:  uplinkWriter,
 			manager: lm,
 		}
 		lm.AddLink(managedWriter, outboundLink.Reader)
 		inboundLink.Writer = managedWriter
+		downWriter := &ManagedWriter{writer: downlinkWriter, manager: lm}
+		lm.AddLink(downWriter, inboundLink.Reader)
+		outboundLink.Writer = downWriter
+		// Expiry can race the registration of a newly authenticated stream.
+		if !userlease.Allowed(user.Email) {
+			lm.CloseAll()
+			return nil, nil, nil, errors.New("consumer authorization expired")
+		}
+		// Keep existing streams on the checked path when a grant is tightened.
+		sessionInbound.CanSpliceCopy = 3
+		inboundLink.Writer = grantlimit.NewWriter(inboundLink.Writer, user.Email, true)
+		outboundLink.Writer = grantlimit.NewWriter(outboundLink.Writer, user.Email, false)
+		if shared := userlease.Bucket(user.Email); shared != nil {
+			inboundLink.Writer = rate.NewRateLimitWriter(inboundLink.Writer, shared)
+			outboundLink.Writer = rate.NewRateLimitWriter(outboundLink.Writer, shared)
+		}
 		if w != nil {
 			sessionInbound.CanSpliceCopy = 3
 			inboundLink.Writer = rate.NewRateLimitWriter(inboundLink.Writer, w)
 			outboundLink.Writer = rate.NewRateLimitWriter(outboundLink.Writer, w)
 		}
-		var t *counter.TrafficCounter
-		if c, ok := d.Counter.Load(sessionInbound.Tag); !ok {
-			t = counter.NewTrafficCounter()
-			d.Counter.Store(sessionInbound.Tag, t)
-		} else {
-			t = c.(*counter.TrafficCounter)
-		}
+		storedCounter, _ := d.Counter.LoadOrStore(sessionInbound.Tag, counter.NewTrafficCounter())
+		t := storedCounter.(*counter.TrafficCounter)
 
 		ts := t.GetCounter(user.Email)
 		upcounter := &counter.XrayTrafficCounter{V: &ts.UpCounter}
@@ -357,6 +370,11 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	var limit *limiter.Limiter
 	var err error
 	if user != nil && len(user.Email) > 0 {
+		if !userlease.Allowed(user.Email) {
+			common.Close(outbound.Writer)
+			common.Interrupt(outbound.Reader)
+			return errors.New("consumer authorization expired")
+		}
 		limit, err = limiter.GetLimiter(sessionInbound.Tag)
 		if err != nil {
 			errors.LogInfo(ctx, "get limiter ", sessionInbound.Tag, " error: ", err)
@@ -374,39 +392,38 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			common.Interrupt(outbound.Reader)
 			return errors.New("Limited ", user.Email, " by conn or ip")
 		}
-		var lm *LinkManager
-		if lmloaded, ok := d.LinkManagers.Load(user.Email); !ok {
-			lm = &LinkManager{
-				links: make(map[*ManagedWriter]buf.Reader),
-			}
-			d.LinkManagers.Store(user.Email, lm)
-		} else {
-			lm = lmloaded.(*LinkManager)
-		}
+		stored, _ := d.LinkManagers.LoadOrStore(user.Email, &LinkManager{links: make(map[*ManagedWriter]buf.Reader)})
+		lm := stored.(*LinkManager)
 		managedWriter := &ManagedWriter{
 			writer:  outbound.Writer,
 			manager: lm,
 		}
 		outbound.Writer = managedWriter
+		sessionInbound.CanSpliceCopy = 3
+		outbound.Writer = grantlimit.NewWriter(outbound.Writer, user.Email, false)
+		if shared := userlease.Bucket(user.Email); shared != nil {
+			outbound.Writer = rate.NewRateLimitWriter(outbound.Writer, shared)
+		}
 		if w != nil {
 			sessionInbound.CanSpliceCopy = 3
 			outbound.Writer = rate.NewRateLimitWriter(outbound.Writer, w)
 		}
-		var t *counter.TrafficCounter
-		if c, ok := d.Counter.Load(sessionInbound.Tag); !ok {
-			t = counter.NewTrafficCounter()
-			d.Counter.Store(sessionInbound.Tag, t)
-		} else {
-			t = c.(*counter.TrafficCounter)
-		}
+		storedCounter, _ := d.Counter.LoadOrStore(sessionInbound.Tag, counter.NewTrafficCounter())
+		t := storedCounter.(*counter.TrafficCounter)
 
 		ts := t.GetCounter(user.Email)
 		downcounter := &counter.XrayTrafficCounter{V: &ts.DownCounter}
+		reader := outbound.Reader
 		outbound.Reader = &CounterReader{
 			Reader:  &buf.TimeoutWrapperReader{Reader: outbound.Reader},
 			Counter: &ts.UpCounter,
 		}
-		lm.AddLink(managedWriter, outbound.Reader)
+		outbound.Reader = grantlimit.NewReader(outbound.Reader, user.Email)
+		lm.AddLink(managedWriter, reader)
+		if !userlease.Allowed(user.Email) {
+			lm.CloseAll()
+			return errors.New("consumer authorization expired")
+		}
 		outbound.Writer = &dispatcher.SizeStatWriter{
 			Counter: downcounter,
 			Writer:  outbound.Writer,

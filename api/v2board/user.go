@@ -2,14 +2,19 @@ package panel
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/wyx2685/v2node/common/grantlimit"
 	"net/http"
 	"strings"
+	"time"
 
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 
+	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -20,11 +25,20 @@ type OnlineUser struct {
 }
 
 type UserInfo struct {
-	Id          int    `json:"id" msgpack:"id"`
-	Uuid        string `json:"uuid" msgpack:"uuid"`
-	SpeedLimit  int    `json:"speed_limit" msgpack:"speed_limit"`
-	DeviceLimit int    `json:"device_limit" msgpack:"device_limit"`
-	GroupID     int    `json:"group_id" msgpack:"group_id"`
+	GrantBandwidthLimits  []grantlimit.Limit `json:"grant_bandwidth_limits,omitempty" msgpack:"grant_bandwidth_limits,omitempty"`
+	ConsumerAccountID     int                `json:"consumer_account_id,omitempty" msgpack:"consumer_account_id,omitempty"`
+	ConsumerLeaseID       string             `json:"consumer_lease_id,omitempty" msgpack:"consumer_lease_id,omitempty"`
+	EntitlementGeneration int64              `json:"entitlement_generation,omitempty" msgpack:"entitlement_generation,omitempty"`
+	LeaseSeconds          int                `json:"lease_seconds,omitempty" msgpack:"lease_seconds,omitempty"`
+	LeaseDeadline         time.Time          `json:"-" msgpack:"-"`
+	LeaseNotAfter         time.Time          `json:"-" msgpack:"-"`
+	DGDeviceID            string             `json:"dg_device_id,omitempty" msgpack:"dg_device_id,omitempty"`
+	WGStaticPub           string             `json:"wg_static_pub,omitempty" msgpack:"wg_static_pub,omitempty"`
+	Id                    int                `json:"id" msgpack:"id"`
+	Uuid                  string             `json:"uuid" msgpack:"uuid"`
+	SpeedLimit            int                `json:"speed_limit" msgpack:"speed_limit"`
+	DeviceLimit           int                `json:"device_limit" msgpack:"device_limit"`
+	GroupID               int                `json:"group_id" msgpack:"group_id"`
 }
 
 type UserListBody struct {
@@ -37,11 +51,15 @@ type AliveMap struct {
 
 // GetUserList will pull user from v2board
 func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
+	c.userMu.Lock()
+	defer c.userMu.Unlock()
+	started := time.Now()
 	const path = "/api/v1/server/UniProxy/user"
 	r, err := c.client.R().
 		SetContext(ctx).
 		SetHeader("If-None-Match", c.userEtag).
 		SetHeader("X-Response-Format", "msgpack").
+		SetHeader("X-Saikyo-Consumer-Leases", "1").
 		SetDoNotParseResponse(true).
 		Get(path)
 	if err != nil {
@@ -102,8 +120,59 @@ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 			userlist.Users = append(userlist.Users, u)
 		}
 	}
+	if serverTime, err := http.ParseTime(r.Header().Get("Date")); err == nil {
+		c.clockMu.Lock()
+		c.serverClock, c.localClock = serverTime, time.Now()
+		c.clockMu.Unlock()
+	}
+	for i := range userlist.Users {
+		for _, limit := range userlist.Users[i].GrantBandwidthLimits {
+			if limit.ID <= 0 || limit.UpMbps < 0 || limit.UpMbps > 1000000 || limit.DownMbps < 0 || limit.DownMbps > 1000000 {
+				return nil, fmt.Errorf("invalid access grant bandwidth")
+			}
+		}
+		if err := userlist.Users[i].validateLease(started); err != nil {
+			return nil, err
+		}
+		if userlist.Users[i].ConsumerLeaseID != "" {
+			userlist.Users[i].LeaseNotAfter = c.ObservationTime().Add(time.Until(userlist.Users[i].LeaseDeadline))
+		}
+	}
 	c.userEtag = r.Header().Get("ETag")
 	return userlist.Users, nil
+}
+
+func (c *Client) ObservationTime() time.Time {
+	c.clockMu.RLock()
+	defer c.clockMu.RUnlock()
+	if c.localClock.IsZero() {
+		return time.Now().UTC()
+	}
+	return c.serverClock.Add(time.Since(c.localClock)).UTC()
+}
+
+func (u *UserInfo) validateLease(started time.Time) error {
+	if u.ConsumerLeaseID == "" && u.LeaseSeconds == 0 && u.EntitlementGeneration == 0 && u.ConsumerAccountID == 0 {
+		return nil
+	}
+	id, err := uuid.Parse(u.ConsumerLeaseID)
+	if err != nil || id == uuid.Nil || u.ConsumerAccountID < 1 || u.Id < 1 || u.EntitlementGeneration < 1 || u.LeaseSeconds < 1 || u.LeaseSeconds > 45 {
+		return fmt.Errorf("invalid consumer authorization lease")
+	}
+	pin, err := hex.DecodeString(u.DGDeviceID)
+	if err != nil || len(pin) != 16 {
+		return fmt.Errorf("missing consumer device pin")
+	}
+	key, err := base64.StdEncoding.DecodeString(u.WGStaticPub)
+	if err != nil || len(key) != 32 {
+		return fmt.Errorf("missing consumer WireGuard pin")
+	}
+	u.ConsumerLeaseID = id.String()
+	u.LeaseDeadline = started.Add(time.Duration(u.LeaseSeconds) * time.Second)
+	if !time.Now().Before(u.LeaseDeadline) {
+		return fmt.Errorf("consumer lease expired during request")
+	}
+	return nil
 }
 
 // GetUserAlive will fetch the alive_ip count for users

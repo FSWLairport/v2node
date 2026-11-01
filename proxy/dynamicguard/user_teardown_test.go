@@ -46,19 +46,29 @@ func TestDGServerRemoveUserIsReversible(t *testing.T) {
 	}
 }
 
-// The panel is the only source of truth for a removed user, so there is no
-// later retry: the entry and its address must go even if the IPC call fails.
-func TestDGServerRemoveUserPeerFailureStillReleasesResources(t *testing.T) {
+func TestDGServerRemoveUserPeerFailureKeepsTheAddressUntilRetry(t *testing.T) {
 	server, pool, device, remover := newTeardownTestServer(t)
 	remover.err = errors.New("wg ipc unavailable")
 
-	server.RemoveUser(device.UserID)
+	if err := server.RemoveUser(device.UserID); err == nil {
+		t.Fatal("peer failure hidden")
+	}
 
-	if server.deviceTable.Lookup(device.UserID, device.DeviceID) != nil {
-		t.Fatal("device entry leaked after peer-removal failure")
+	if server.deviceTable.Lookup(device.UserID, device.DeviceID) == nil {
+		t.Fatal("failed peer lost its binding before retry")
+	}
+	if pool.Reserve(device.AssignedIP) {
+		t.Fatal("an installed old peer's address was reassigned")
+	}
+	if server.userKeyMap.GetByID(device.UserID) != nil {
+		t.Fatal("failed peer remains authorized")
+	}
+	remover.err = nil
+	if err := server.RemoveUser(device.UserID); err != nil {
+		t.Fatal(err)
 	}
 	if !pool.Reserve(device.AssignedIP) {
-		t.Fatal("assigned IP leaked after peer-removal failure")
+		t.Fatal("successful retry did not release address")
 	}
 }
 

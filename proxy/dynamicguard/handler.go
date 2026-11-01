@@ -12,12 +12,16 @@ import (
 
 // UserEntry 用户信息
 type UserEntry struct {
-	UserID      int
-	UUID        string
-	UserKey     [32]byte
-	DeviceLimit int
-	SpeedLimit  int
-	GroupID     int
+	LeaseTag       string
+	Pinned         bool
+	PinnedDeviceID [16]byte
+	PinnedWGKey    [32]byte
+	UserID         int
+	UUID           string
+	UserKey        [32]byte
+	DeviceLimit    int
+	SpeedLimit     int
+	GroupID        int
 }
 
 // Handler 处理 ClientInit 报文
@@ -124,6 +128,10 @@ func (h *Handler) HandleClientInit(data []byte, srcAddr *net.UDPAddr, udpConn *n
 			"device": fmt.Sprintf("%x", msg.DeviceID[:4]),
 		}).Debug("[DynamicGuard] unknown user key")
 		return // 静默丢弃
+	}
+
+	if user.Pinned && (user.PinnedDeviceID != msg.DeviceID || user.PinnedWGKey != msg.WGStaticPub) {
+		return
 	}
 
 	// Step 3: Cookie 校验

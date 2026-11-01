@@ -3,12 +3,16 @@ package dynamicguard
 import (
 	"net/netip"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 
 	"github.com/amnezia-vpn/amneziawg-go/tun"
+	"github.com/wyx2685/v2node/common/counter"
+	"github.com/wyx2685/v2node/common/grantlimit"
+	"github.com/wyx2685/v2node/common/userlease"
 )
 
 // DGACL is the server-enforced egress policy of one network. It is unrelated to
@@ -121,8 +125,10 @@ func (p *aclPolicy) allows(groupID int, dst netip.Addr) bool {
 // each peer's WireGuard allowed_ip, which is that peer's own /32 or /128.
 type aclTUN struct {
 	tun.Device
-	devices *DeviceTable
-	policy  atomic.Pointer[aclPolicy]
+	devices         *DeviceTable
+	users           *UserKeyMap
+	consumerTraffic sync.Map
+	policy          atomic.Pointer[aclPolicy]
 	// flows observes what this device forwards. It shares the Write path with
 	// the ACL because that is the only place a decapsulated packet exists.
 	flows   *flowLog
@@ -147,7 +153,7 @@ func (a *aclTUN) Dropped() uint64 { return a.dropped.Load() }
 func (a *aclTUN) Write(bufs [][]byte, offset int) (int, error) {
 	policy := a.policy.Load()
 	logging := a.flows.enabled.Load()
-	if policy == nil && !logging {
+	if policy == nil && !logging && a.users == nil {
 		return a.Device.Write(bufs, offset)
 	}
 
@@ -160,7 +166,7 @@ func (a *aclTUN) Write(bufs [][]byte, offset int) (int, error) {
 		now = time.Now()
 	}
 	for i, buf := range bufs {
-		if policy == nil || a.permit(policy, buf, offset) {
+		if (policy == nil || a.permit(policy, buf, offset)) && (a.users == nil || a.consumerPermit(buf, offset, true)) {
 			// Only forwarded packets are recorded: a denied one never reached
 			// anything, and logging it would describe a connection that did not
 			// happen.
@@ -190,6 +196,82 @@ func (a *aclTUN) Write(bufs [][]byte, offset int) (int, error) {
 		return 0, nil
 	}
 	return a.Device.Write(filtered, offset)
+}
+
+func (a *aclTUN) consumerPermit(buf []byte, offset int, upload bool) bool {
+	if offset > len(buf) {
+		return false
+	}
+	src, dst, ok := packetAddrs(buf[offset:])
+	if !ok {
+		return false
+	}
+	address := dst
+	if upload {
+		address = src
+	}
+	id, _, known := a.devices.OwnerByIP(address)
+	if !known {
+		return false
+	}
+	user := a.users.GetByID(id)
+	if user == nil {
+		return false
+	}
+	if !grantlimit.AllowPacket(user.LeaseTag, upload, len(buf)-offset) {
+		return false
+	}
+	if !userlease.AllowPacket(user.LeaseTag, len(buf)-offset) {
+		return false
+	}
+	if userlease.Managed(user.LeaseTag) {
+		stored, ok := a.consumerTraffic.Load(id)
+		if !ok {
+			stored, _ = a.consumerTraffic.LoadOrStore(id, &counter.TrafficStorage{})
+		}
+		traffic := stored.(*counter.TrafficStorage)
+		if upload {
+			traffic.UpCounter.Add(int64(len(buf) - offset))
+		} else {
+			traffic.DownCounter.Add(int64(len(buf) - offset))
+		}
+	}
+	return true
+}
+func (a *aclTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+	if a.users == nil {
+		return a.Device.Read(bufs, sizes, offset)
+	}
+	for {
+		n, err := a.Device.Read(bufs, sizes, offset)
+		kept := 0
+		for i := 0; i < n; i++ {
+			if a.consumerPermit(bufs[i][:offset+sizes[i]], offset, false) {
+				if kept != i {
+					copy(bufs[kept][offset:], bufs[i][offset:offset+sizes[i]])
+				}
+				sizes[kept] = sizes[i]
+				kept++
+			} else {
+				a.noteDrops(1)
+			}
+		}
+		if kept > 0 || err != nil {
+			return kept, err
+		}
+	}
+}
+func (a *aclTUN) collectConsumerTraffic() []UserTraffic {
+	out := []UserTraffic{}
+	a.consumerTraffic.Range(func(key, value any) bool {
+		traffic := value.(*counter.TrafficStorage)
+		up, down := traffic.UpCounter.Swap(0), traffic.DownCounter.Swap(0)
+		if up > 0 || down > 0 {
+			out = append(out, UserTraffic{UserID: key.(int), Upload: up, Download: down})
+		}
+		return true
+	})
+	return out
 }
 
 func (a *aclTUN) permit(policy *aclPolicy, buf []byte, offset int) bool {

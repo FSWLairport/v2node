@@ -10,6 +10,7 @@ import (
 	panel "github.com/wyx2685/v2node/api/v2board"
 	"github.com/wyx2685/v2node/common/counter"
 	"github.com/wyx2685/v2node/common/format"
+	"github.com/wyx2685/v2node/common/userlease"
 	"github.com/wyx2685/v2node/core/app/dispatcher"
 	"github.com/wyx2685/v2node/proxy/satls"
 	"github.com/xtls/xray-core/common/protocol"
@@ -44,6 +45,10 @@ func (v *V2Core) GetUserManager(tag string) (proxy.UserManager, error) {
 }
 
 func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo) error {
+	// Close streams before an inbound manager lookup or removal can block.
+	for _, u := range users {
+		vc.CloseUserConnections(tag, u.Uuid)
+	}
 	userManager, err := vc.GetUserManager(tag)
 	if err != nil {
 		return fmt.Errorf("get user manager error: %s", err)
@@ -53,17 +58,30 @@ func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo
 	defer vc.users.mapLock.Unlock()
 	for i := range users {
 		user = format.UserTag(tag, users[i].Uuid)
+		if vc.users.uidMap[user] == 0 {
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err = userManager.RemoveUser(ctx, user)
 		cancel()
 		if err != nil {
 			return err
 		}
-		delete(vc.users.uidMap, user)
 		if v, ok := vc.dispatcher.Counter.Load(tag); ok {
 			tc := v.(*counter.TrafficCounter)
+			if value, ok := tc.Counters.Load(user); ok {
+				storage := value.(*counter.TrafficStorage)
+				up, down := storage.UpCounter.Swap(0), storage.DownCounter.Swap(0)
+				if up > 0 || down > 0 {
+					if vc.users.retired == nil {
+						vc.users.retired = map[string][]retiredTraffic{}
+					}
+					vc.users.retired[tag] = append(vc.users.retired[tag], retiredTraffic{traffic: panel.UserTraffic{UID: vc.users.uidMap[user], Upload: up, Download: down}, consumer: userlease.Managed(user)})
+				}
+			}
 			tc.Delete(user)
 		}
+		delete(vc.users.uidMap, user)
 		if v, ok := vc.dispatcher.LinkManagers.Load(user); ok {
 			lm := v.(*dispatcher.LinkManager)
 			lm.CloseAll()
@@ -74,19 +92,55 @@ func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo
 }
 
 func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserTraffic, error) {
+	return vc.collectTraffic(tag, mintraffic, 0)
+}
+func (vc *V2Core) GetConsumerTrafficSlice(tag string) ([]panel.UserTraffic, error) {
+	return vc.collectTraffic(tag, 0, 1)
+}
+func (vc *V2Core) GetEnterpriseTrafficSlice(tag string) ([]panel.UserTraffic, error) {
+	return vc.collectTraffic(tag, 0, 2)
+}
+func (vc *V2Core) CloseUserConnections(tag, uuid string) {
+	if vc.dispatcher == nil {
+		return
+	}
+	user := format.UserTag(tag, uuid)
+	if value, ok := vc.dispatcher.LinkManagers.Load(user); ok {
+		value.(*dispatcher.LinkManager).CloseAll()
+	}
+}
+func (vc *V2Core) collectTraffic(tag string, mintraffic int, mode int) ([]panel.UserTraffic, error) {
 	trafficSlice := make([]panel.UserTraffic, 0)
-	vc.users.mapLock.RLock()
-	defer vc.users.mapLock.RUnlock()
+	vc.users.mapLock.Lock()
+	defer vc.users.mapLock.Unlock()
+	if retired := vc.users.retired[tag]; len(retired) > 0 {
+		remaining := retired[:0]
+		for _, entry := range retired {
+			if mode == 0 || mode == 1 && entry.consumer || mode == 2 && !entry.consumer {
+				trafficSlice = append(trafficSlice, entry.traffic)
+			} else {
+				remaining = append(remaining, entry)
+			}
+		}
+		vc.users.retired[tag] = remaining
+	}
 	if v, ok := vc.dispatcher.Counter.Load(tag); ok {
 		c := v.(*counter.TrafficCounter)
 		c.Counters.Range(func(key, value interface{}) bool {
 			email := key.(string)
+			managed := userlease.Managed(email)
+			if mode == 1 && !managed || mode == 2 && managed {
+				return true
+			}
 			traffic := value.(*counter.TrafficStorage)
 			up := traffic.UpCounter.Load()
 			down := traffic.DownCounter.Load()
-			if up+down > int64(mintraffic*1000) {
-				traffic.UpCounter.Store(0)
-				traffic.DownCounter.Store(0)
+			threshold := int64(mintraffic * 1000)
+			if managed {
+				threshold = 0
+			}
+			if up+down > threshold {
+				up, down = traffic.UpCounter.Swap(0), traffic.DownCounter.Swap(0)
 				if vc.users.uidMap[email] == 0 {
 					c.Delete(email)
 					return true
@@ -104,7 +158,7 @@ func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserT
 		}
 		return trafficSlice, nil
 	}
-	return nil, nil
+	return trafficSlice, nil
 }
 
 // UIDByEmail resolves the user tag an inbound authenticated ("tag|uuid") to the
@@ -119,9 +173,6 @@ func (v *V2Core) UIDByEmail(email string) int {
 func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
 	v.users.mapLock.Lock()
 	defer v.users.mapLock.Unlock()
-	for i := range p.Users {
-		v.users.uidMap[format.UserTag(p.Tag, p.Users[i].Uuid)] = p.Users[i].Id
-	}
 	var users []*protocol.User
 	switch p.NodeInfo.Type {
 	case "vmess":
@@ -150,7 +201,7 @@ func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
 	if err != nil {
 		return 0, fmt.Errorf("get user manager error: %s", err)
 	}
-	for _, u := range users {
+	for i, u := range users {
 		mUser, err := u.ToMemoryUser()
 		if err != nil {
 			return 0, err
@@ -161,6 +212,7 @@ func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
 		if err != nil {
 			return 0, err
 		}
+		v.users.uidMap[format.UserTag(p.Tag, p.Users[i].Uuid)] = p.Users[i].Id
 	}
 	return len(users), nil
 }

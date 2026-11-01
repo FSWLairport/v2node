@@ -8,10 +8,10 @@ import (
 	log "github.com/sirupsen/logrus"
 	panel "github.com/wyx2685/v2node/api/v2board"
 	"github.com/wyx2685/v2node/common/task"
-	vCore "github.com/wyx2685/v2node/core"
 )
 
 func (c *Controller) startTasks(node *panel.NodeInfo) {
+	c.startConsumerTasks()
 	// fetch node info task
 	c.nodeInfoMonitorPeriodic = &task.Task{
 		Name:     "nodeInfoMonitor",
@@ -89,86 +89,20 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		return nil
 	}
 
-	// DynamicGuard 模式: 更新 userKeyMap，清理已删除用户
-	if c.dgServer != nil {
-		if newU != nil {
-			// 找出被删除的用户，移除其设备和 WG peer
-			newMap := make(map[int]struct{}, len(newU))
-			removedCount := 0
-			for _, u := range newU {
-				newMap[u.Id] = struct{}{}
-			}
-			for _, u := range c.userList {
-				if _, exists := newMap[u.Id]; !exists {
-					c.dgServer.RemoveUser(u.Id)
-					removedCount++
-				}
-			}
-			c.userList = newU
-			c.updateDGUsers(c.dgServer)
-			log.WithFields(log.Fields{
-				"tag":           c.tag,
-				"current_users": len(newU),
-				"removed_users": removedCount,
-			}).Info("DynamicGuard users refreshed")
-		}
-		return nil
-	}
-
-	// get user alive
-	newA, err := c.apiClient.GetUserAlive(ctx)
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
-		}
-		log.WithFields(log.Fields{
-			"tag": c.tag,
-			"err": err,
-		}).Error("Get alive list failed")
-		return nil
-	}
-
-	// update alive list
-	if newA != nil {
-		c.limiter.AliveList = newA
-	}
-	// node no changed, check users
-	if newU == nil {
-		log.WithField("tag", c.tag).Debug("User list no change")
-		return nil
-	}
-	deleted, added, modified := compareUserList(c.userList, newU)
-	if len(deleted) > 0 {
-		// have deleted users
-		err = c.server.DelUsers(deleted, c.tag, c.info)
+	var alive map[int]int
+	if c.dgServer == nil {
+		alive, err = c.apiClient.GetUserAlive(ctx)
 		if err != nil {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Error("Delete users failed")
-			return nil
+			log.WithField("tag", c.tag).WithError(err).Warn("Alive list unavailable; continue authorization refresh")
 		}
 	}
-	if len(added) > 0 {
-		// have added users
-		_, err = c.server.AddUsers(&vCore.AddUsersParams{
-			Tag:      c.tag,
-			NodeInfo: c.info,
-			Users:    added,
-		})
-		if err != nil {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Error("Add users failed")
-			return nil
-		}
+	c.usersMu.Lock()
+	defer c.usersMu.Unlock()
+	if alive != nil && c.limiter != nil {
+		c.limiter.SetAliveList(alive)
 	}
-	if len(added) > 0 || len(deleted) > 0 || len(modified) > 0 {
-		// update Limiter
-		c.limiter.UpdateUser(c.tag, added, deleted, modified)
+	if err = c.applyUsersLocked(newU); err != nil {
+		log.WithField("tag", c.tag).WithError(err).Warn("User refresh incomplete")
 	}
-	c.userList = newU
-	log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))
 	return nil
 }

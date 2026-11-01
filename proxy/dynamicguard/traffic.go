@@ -1,6 +1,7 @@
 package dynamicguard
 
 import (
+	"github.com/wyx2685/v2node/common/userlease"
 	"sync"
 )
 
@@ -23,14 +24,22 @@ func NewUserKeyMap() *UserKeyMap {
 func (m *UserKeyMap) Get(key [32]byte) *UserEntry {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.entries[key]
+	entry := m.entries[key]
+	if entry != nil && !userlease.Allowed(entry.LeaseTag) {
+		return nil
+	}
+	return entry
 }
 
 // GetByID 按 user_id 查找用户
 func (m *UserKeyMap) GetByID(userID int) *UserEntry {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.byID[userID]
+	entry := m.byID[userID]
+	if entry != nil && !userlease.Allowed(entry.LeaseTag) {
+		return nil
+	}
+	return entry
 }
 
 // Update 全量更新用户列表

@@ -38,7 +38,13 @@ type V2Core struct {
 
 type UserMap struct {
 	uidMap  map[string]int
+	retired map[string][]retiredTraffic
 	mapLock sync.RWMutex
+}
+
+type retiredTraffic struct {
+	traffic  panel.UserTraffic
+	consumer bool
 }
 
 func New(config *conf.Conf) *V2Core {

@@ -51,6 +51,7 @@ type DGServer struct {
 	handler       *Handler
 	deviceTable   *DeviceTable
 	userKeyMap    *UserKeyMap
+	consumerUsers sync.Map
 	ipPools       map[int]*IPPool
 	leaseMgr      *LeaseManager
 	idemCache     *IdempotencyCache
@@ -211,6 +212,7 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		Prefixes:    ipPrefixes,
 		Params:      awgParams,
 		DeviceTable: deviceTable,
+		UserKeys:    userKeyMap,
 		ACL:         newACLPolicy(settings.ACL),
 
 		AccessLogEnabled: cfg.AccessLogEnabled,
@@ -306,6 +308,11 @@ func (s *DGServer) Start() error {
 
 // UpdateUsers 更新用户列表
 func (s *DGServer) UpdateUsers(users []*UserEntry) {
+	for _, user := range users {
+		if user.LeaseTag != "" {
+			s.consumerUsers.Store(user.UserID, true)
+		}
+	}
 	oldCount := s.userKeyMap.Len()
 	s.userKeyMap.Update(users)
 	log.WithFields(log.Fields{
@@ -325,19 +332,40 @@ func (s *DGServer) DrainFlowRecords() []FlowRecord {
 }
 
 // GetUserTraffic 通过 WG IPC 采集 peer 流量并按用户聚合
-func (s *DGServer) GetUserTraffic() []UserTraffic {
+func (s *DGServer) GetEnterpriseTraffic() []UserTraffic {
 	deltas := s.wgDevice.CollectTrafficDelta()
-	return CollectUserTraffic(deltas, s.deviceTable)
+	legacy := CollectUserTraffic(deltas, s.deviceTable)
+	out := legacy[:0]
+	for _, traffic := range legacy {
+		if _, consumer := s.consumerUsers.Load(traffic.UserID); !consumer {
+			out = append(out, traffic)
+		}
+	}
+	return out
+}
+func (s *DGServer) GetUserTraffic() []UserTraffic {
+	out := s.GetEnterpriseTraffic()
+	if s.wgDevice.aclDev != nil {
+		out = append(out, s.wgDevice.aclDev.collectConsumerTraffic()...)
+	}
+	return out
+}
+
+func (s *DGServer) GetConsumerTraffic() []UserTraffic {
+	if s.wgDevice == nil || s.wgDevice.aclDev == nil {
+		return nil
+	}
+	return s.wgDevice.aclDev.collectConsumerTraffic()
 }
 
 // RemoveUser 移除已删除用户的所有设备（WG peer、IP 池）。
 // 用户从面板消失只表示订阅到期或被暂时移除，因此不留墓碑：面板下一次把该用户
 // 发回来时 UpdateUsers 会直接恢复它。
-func (s *DGServer) RemoveUser(userID int) {
+func (s *DGServer) RemoveUser(userID int) error {
 	s.userKeyMap.Remove(userID)
 	devices := s.deviceTable.GetDevicesByUser(userID)
 	if len(devices) == 0 {
-		return
+		return nil
 	}
 	log.WithFields(log.Fields{
 		"user_id":      userID,
@@ -346,10 +374,9 @@ func (s *DGServer) RemoveUser(userID int) {
 
 	removed := 0
 	for _, device := range devices {
-		// 即使 peer 删除失败也要把条目摘掉：用户已经不在名单里，没有后续重试的
-		// 机会，留着条目只会永久占住 IP 和设备表。
 		if err := s.peerRemover.RemovePeer(device.WGStaticPub); err != nil {
 			log.Warnf("[DynamicGuard] remove peer for deleted user %d: %v", userID, err)
+			return err
 		}
 		entry, ok := s.deviceTable.RemoveByID(userID, device.DeviceID)
 		if !ok {
@@ -363,6 +390,7 @@ func (s *DGServer) RemoveUser(userID int) {
 		removed++
 	}
 	log.Infof("[DynamicGuard] removed %d devices for deleted user %d", removed, userID)
+	return nil
 }
 
 // Close 关闭 DG 服务端

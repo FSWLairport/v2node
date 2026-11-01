@@ -2,11 +2,17 @@ package node
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"sync"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	panel "github.com/wyx2685/v2node/api/v2board"
 	"github.com/wyx2685/v2node/common/accesslog"
+	"github.com/wyx2685/v2node/common/consumertraffic"
+	"github.com/wyx2685/v2node/common/format"
 	"github.com/wyx2685/v2node/common/task"
 	"github.com/wyx2685/v2node/conf"
 	"github.com/wyx2685/v2node/core"
@@ -15,6 +21,17 @@ import (
 )
 
 type Controller struct {
+	usersMu                 sync.Mutex
+	closed                  bool
+	consumerFlushMu         sync.Mutex
+	consumerStore           *consumertraffic.Spool
+	consumerRequested       bool
+	consumerCancel          context.CancelFunc
+	consumerWorkers         sync.WaitGroup
+	lastConsumerPull        time.Time
+	billingUsers            map[int]panel.UserInfo
+	legacyTraffic           map[int][2]int64
+	teardown                map[int]panel.UserInfo
 	server                  *core.V2Core
 	apiClient               *panel.Client
 	tag                     string
@@ -64,6 +81,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 		return fmt.Errorf("failed to get user alive list: %s", err)
 	}
 	c.tag = node.Tag
+	c.initializeConsumers()
 
 	// DynamicGuard 走独立路径，不使用 xray-core
 	if node.Type == "dynamicguard" {
@@ -172,20 +190,48 @@ func (c *Controller) updateDGUsers(dgServer *dynamicguard.DGServer) {
 	users := make([]*dynamicguard.UserEntry, 0, len(c.userList))
 	for _, u := range c.userList {
 		userKey := dynamicguard.UserKeyFromUUID(u.Uuid)
-		users = append(users, &dynamicguard.UserEntry{
+		entry := &dynamicguard.UserEntry{
 			UserID:      u.Id,
 			UUID:        u.Uuid,
 			UserKey:     userKey,
 			DeviceLimit: u.DeviceLimit,
 			SpeedLimit:  u.SpeedLimit,
 			GroupID:     u.GroupID,
-		})
+		}
+		entry.LeaseTag = format.UserTag(c.tag, u.Uuid)
+		if u.DGDeviceID != "" || u.WGStaticPub != "" {
+			device, deviceErr := hex.DecodeString(u.DGDeviceID)
+			key, keyErr := base64.StdEncoding.DecodeString(u.WGStaticPub)
+			if deviceErr != nil || keyErr != nil || len(device) != 16 || len(key) != 32 {
+				log.WithField("uid", u.Id).Warn("Invalid device pin; credential not installed")
+				continue
+			}
+			entry.Pinned = true
+			copy(entry.PinnedDeviceID[:], device)
+			copy(entry.PinnedWGKey[:], key)
+		}
+		users = append(users, entry)
 	}
 	dgServer.UpdateUsers(users)
 }
 
 // Close implement the Close() function of the service interface
 func (c *Controller) Close() error {
+	c.usersMu.Lock()
+	c.closed = true
+	c.usersMu.Unlock()
+	if c.consumerCancel != nil {
+		c.consumerCancel()
+		c.consumerWorkers.Wait()
+	}
+	c.usersMu.Lock()
+	for _, u := range c.userList {
+		c.revokeConsumerLocked(u)
+	}
+	if err := c.snapshotTrafficLocked(true); err != nil {
+		log.WithError(err).Warn("Consumer traffic retained in memory during shutdown")
+	}
+	c.usersMu.Unlock()
 	limiter.DeleteLimiter(c.tag)
 	accesslog.Disable(c.tag)
 	if c.nodeInfoMonitorPeriodic != nil {

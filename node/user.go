@@ -24,7 +24,13 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		reportmin = c.info.Common.BaseConfig.NodeReportMinTraffic
 		devicemin = c.info.Common.BaseConfig.DeviceOnlineMinTraffic
 	}
-	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, reportmin)
+	c.usersMu.Lock()
+	snapshotErr := c.snapshotTrafficLocked(false)
+	userTraffic := c.drainLegacyTrafficLocked(reportmin)
+	c.usersMu.Unlock()
+	if snapshotErr != nil {
+		log.WithField("tag", c.tag).WithError(snapshotErr).Warn("Consumer snapshot deferred")
+	}
 	if len(userTraffic) > 0 {
 		err = c.apiClient.ReportUserTraffic(ctx, userTraffic)
 		if err != nil {
@@ -87,18 +93,15 @@ func (c *Controller) reportDGTraffic(ctx context.Context) error {
 	c.reportDGLeases(ctx)
 	c.reportDGAccessLogs(ctx)
 
-	dgTraffic := c.dgServer.GetUserTraffic()
-	if len(dgTraffic) == 0 {
-		return nil
+	c.usersMu.Lock()
+	snapshotErr := c.snapshotTrafficLocked(false)
+	userTraffic := c.drainLegacyTrafficLocked(0)
+	c.usersMu.Unlock()
+	if snapshotErr != nil {
+		log.WithField("tag", c.tag).WithError(snapshotErr).Warn("Consumer snapshot deferred")
 	}
-
-	userTraffic := make([]panel.UserTraffic, 0, len(dgTraffic))
-	for _, t := range dgTraffic {
-		userTraffic = append(userTraffic, panel.UserTraffic{
-			UID:      t.UserID,
-			Upload:   t.Upload,
-			Download: t.Download,
-		})
+	if len(userTraffic) == 0 {
+		return nil
 	}
 
 	err := c.apiClient.ReportUserTraffic(ctx, userTraffic)
@@ -217,6 +220,12 @@ func compareUserList(old, new []panel.UserInfo) (deleted, added, modified []pane
 		if o, ok := oldMap[u.Uuid]; !ok {
 			added = append(added, u)
 		} else {
+			if o.Id != u.Id || o.ConsumerLeaseID != u.ConsumerLeaseID || o.EntitlementGeneration != u.EntitlementGeneration || o.DGDeviceID != u.DGDeviceID || o.WGStaticPub != u.WGStaticPub || o.GroupID != u.GroupID {
+				deleted = append(deleted, o)
+				added = append(added, u)
+				delete(oldMap, u.Uuid)
+				continue
+			}
 			if o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit {
 				modified = append(modified, u)
 			}

@@ -19,6 +19,7 @@ func Init() {
 }
 
 type Limiter struct {
+	access        sync.Mutex
 	Nodetype      string         // Node type, e.g. "v2ray", "trojan", "shadowsocks"
 	SpeedLimit    int            // Node speed limit in Mbps
 	UserOnlineIP  *sync.Map      // Key: TagUUID, value: {Key: Ip, value: Uid}
@@ -85,6 +86,8 @@ func DeleteLimiter(tag string) {
 }
 
 func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel.UserInfo, modified []panel.UserInfo) {
+	l.access.Lock()
+	defer l.access.Unlock()
 	for i := range deleted {
 		l.UserLimitInfo.Delete(format.UserTag(tag, deleted[i].Uuid))
 		l.UserOnlineIP.Delete(format.UserTag(tag, deleted[i].Uuid))
@@ -130,6 +133,8 @@ func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel
 }
 
 func (l *Limiter) UpdateDynamicSpeedLimit(tag, uuid string, limit int, expire time.Time) error {
+	l.access.Lock()
+	defer l.access.Unlock()
 	if v, ok := l.UserLimitInfo.Load(format.UserTag(tag, uuid)); ok {
 		info := v.(*UserLimitInfo)
 		info.DynamicSpeedLimit = limit
@@ -141,6 +146,8 @@ func (l *Limiter) UpdateDynamicSpeedLimit(tag, uuid string, limit int, expire ti
 }
 
 func (l *Limiter) CheckLimit(taguuid string, ip string, noUDPsource bool) (DynamicBucket *rate.DynamicBucket, Reject bool) {
+	l.access.Lock()
+	defer l.access.Unlock()
 	// check if ipv4 mapped ipv6
 	ip = strings.TrimPrefix(ip, "::ffff:")
 
@@ -217,6 +224,8 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, noUDPsource bool) (Dynam
 }
 
 func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {
+	l.access.Lock()
+	defer l.access.Unlock()
 	var onlineUser []panel.OnlineUser
 	l.OldUserOnline = new(sync.Map)
 	l.UserOnlineIP.Range(func(key, value interface{}) bool {
@@ -239,4 +248,10 @@ func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {
 type UserIpList struct {
 	Uid    int      `json:"Uid"`
 	IpList []string `json:"Ips"`
+}
+
+func (l *Limiter) SetAliveList(alive map[int]int) {
+	l.access.Lock()
+	defer l.access.Unlock()
+	l.AliveList = alive
 }

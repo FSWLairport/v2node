@@ -213,7 +213,8 @@ type WGDeviceConfig struct {
 	Prefixes    []netip.Prefix // 各 IP 池的子网前缀（用于路由和 NAT）
 	Params      AmneziaParams  // per-node AmneziaWG 抗 DPI 参数（与下发给客户端的同一组）
 	DeviceTable *DeviceTable   // 按包的源隧道 IP 定位所属网络（ACL 强制用）
-	ACL         *aclPolicy     // 服务端强制的出网策略，nil 表示不过滤
+	UserKeys    *UserKeyMap
+	ACL         *aclPolicy // 服务端强制的出网策略，nil 表示不过滤
 	// AccessLogEnabled 打开逐连接记录。关闭时数据面只多一次原子读。
 	AccessLogEnabled bool
 }
@@ -250,6 +251,7 @@ func NewWGDevice(cfg *WGDeviceConfig) (*WGDevice, error) {
 
 	// 包一层 ACL 过滤：从 peer 解封装后写入内核的方向是客户端出网的必经之路
 	aclDev := newACLTUN(tunDev, cfg.DeviceTable, cfg.ACL, cfg.AccessLogEnabled)
+	aclDev.users = cfg.UserKeys
 
 	// 创建 wireguard-go 设备
 	dev := device.NewDevice(aclDev, bind, wgLogger)
