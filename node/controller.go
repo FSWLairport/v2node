@@ -2,8 +2,6 @@ package node
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
@@ -13,6 +11,7 @@ import (
 	"github.com/wyx2685/v2node/common/accesslog"
 	"github.com/wyx2685/v2node/common/consumertraffic"
 	"github.com/wyx2685/v2node/common/format"
+	"github.com/wyx2685/v2node/common/rate"
 	"github.com/wyx2685/v2node/common/task"
 	"github.com/wyx2685/v2node/conf"
 	"github.com/wyx2685/v2node/core"
@@ -40,6 +39,8 @@ type Controller struct {
 	aliveMap                map[int]int
 	conf                    *conf.NodeConfig
 	info                    *panel.NodeInfo
+	eventsCancel            context.CancelFunc
+	eventsDone              chan struct{}
 	nodeInfoMonitorPeriodic *task.Task
 	userReportPeriodic      *task.Task
 	renewCertPeriodic       *task.Task
@@ -90,6 +91,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 
 	// add limiter
 	l := limiter.AddLimiter(c.info.Type, c.tag, c.userList, c.aliveMap)
+	l.OrgLimiter = rate.NewOrganizationLimiter(node.Common.OrgBandwidthLimits)
 	c.limiter = l
 	if node.Security == panel.Tls {
 		err = c.requestCert()
@@ -139,21 +141,26 @@ func (c *Controller) startDynamicGuard(node *panel.NodeInfo) error {
 		"ip_pool_count":  len(dgSettings.IPPools),
 		"route_count":    len(dgSettings.Routes),
 		"acl_networks":   len(dgSettings.ACL),
+		"network_orgs":   len(dgSettings.NetworkOrgs),
 		"cookie_enabled": dgSettings.CookieEnabled,
 		"pow_difficulty": dgSettings.PowDifficulty,
 		"mtu":            dgSettings.MTU,
 	}).Info("Starting DynamicGuard node")
 
 	dgServer, err := dynamicguard.NewDGServer(&dynamicguard.DGServerConfig{
-		ListenAddr:       listenAddr,
-		AccessLogEnabled: c.accessLogEnabled(),
+		ListenAddr:         listenAddr,
+		AccessLogEnabled:   c.accessLogEnabled(),
+		OrgBandwidthLimits: node.Common.OrgBandwidthLimits,
 		DGSettings: &dynamicguard.DGSettings{
 			ServerWGKeyPath:   dgSettings.ServerWGKeyPath,
 			ServerWGPublicKey: dgSettings.ServerWGPublicKey,
 			LeaseTTL:          dgSettings.LeaseTTL,
 			IPPools:           dgSettings.IPPools,
+			NetworkOrgs:       dgSettings.NetworkOrgs,
+			TenantPools:       dgSettings.TenantPools,
 			Routes:            dgSettings.Routes,
 			ACL:               dgSettings.ACL,
+			NodeACL:           dgSettings.NodeACL,
 			CookieEnabled:     dgSettings.CookieEnabled,
 			PowDifficulty:     dgSettings.PowDifficulty,
 			MTU:               dgSettings.MTU,
@@ -200,15 +207,9 @@ func (c *Controller) updateDGUsers(dgServer *dynamicguard.DGServer) {
 		}
 		entry.LeaseTag = format.UserTag(c.tag, u.Uuid)
 		if u.DGDeviceID != "" || u.WGStaticPub != "" {
-			device, deviceErr := hex.DecodeString(u.DGDeviceID)
-			key, keyErr := base64.StdEncoding.DecodeString(u.WGStaticPub)
-			if deviceErr != nil || keyErr != nil || len(device) != 16 || len(key) != 32 {
-				log.WithField("uid", u.Id).Warn("Invalid device pin; credential not installed")
-				continue
+			if err := entry.Pin(u.DGDeviceID, u.WGStaticPub); err != nil {
+				log.WithFields(log.Fields{"tag": c.tag, "user_id": u.Id, "err": err}).Warn("DynamicGuard credential pin unusable; it rejects every device")
 			}
-			entry.Pinned = true
-			copy(entry.PinnedDeviceID[:], device)
-			copy(entry.PinnedWGKey[:], key)
 		}
 		users = append(users, entry)
 	}
@@ -232,6 +233,10 @@ func (c *Controller) Close() error {
 		log.WithError(err).Warn("Consumer traffic retained in memory during shutdown")
 	}
 	c.usersMu.Unlock()
+	if c.eventsCancel != nil {
+		c.eventsCancel()
+		<-c.eventsDone
+	}
 	limiter.DeleteLimiter(c.tag)
 	accesslog.Disable(c.tag)
 	if c.nodeInfoMonitorPeriodic != nil {

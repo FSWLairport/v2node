@@ -212,6 +212,14 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		downWriter := &ManagedWriter{writer: downlinkWriter, manager: lm}
 		lm.AddLink(downWriter, inboundLink.Reader)
 		outboundLink.Writer = downWriter
+		// Recheck after registering: removal may have closed and deleted the previous manager.
+		if _, active := limit.UserLimitInfo.Load(user.Email); !active {
+			common.Close(managedWriter)
+			common.Close(outboundLink.Writer)
+			common.Interrupt(outboundLink.Reader)
+			common.Interrupt(inboundLink.Reader)
+			return nil, nil, nil, errors.New("credential revoked during dispatch")
+		}
 		// Expiry can race the registration of a newly authenticated stream.
 		if !userlease.Allowed(user.Email) {
 			lm.CloseAll()
@@ -229,6 +237,15 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 			sessionInbound.CanSpliceCopy = 3
 			inboundLink.Writer = rate.NewRateLimitWriter(inboundLink.Writer, w)
 			outboundLink.Writer = rate.NewRateLimitWriter(outboundLink.Writer, w)
+		}
+		up, down := limit.OrganizationBuckets(user.Email)
+		if up != nil {
+			sessionInbound.CanSpliceCopy = 3
+			inboundLink.Writer = rate.NewRateLimitWriter(inboundLink.Writer, up)
+		}
+		if down != nil {
+			sessionInbound.CanSpliceCopy = 3
+			outboundLink.Writer = rate.NewRateLimitWriter(outboundLink.Writer, down)
 		}
 		storedCounter, _ := d.Counter.LoadOrStore(sessionInbound.Tag, counter.NewTrafficCounter())
 		t := storedCounter.(*counter.TrafficCounter)
@@ -408,6 +425,15 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			sessionInbound.CanSpliceCopy = 3
 			outbound.Writer = rate.NewRateLimitWriter(outbound.Writer, w)
 		}
+		up, down := limit.OrganizationBuckets(user.Email)
+		if up != nil {
+			sessionInbound.CanSpliceCopy = 3
+			outbound.Reader = rate.NewRateLimitReader(outbound.Reader, up)
+		}
+		if down != nil {
+			sessionInbound.CanSpliceCopy = 3
+			outbound.Writer = rate.NewRateLimitWriter(outbound.Writer, down)
+		}
 		storedCounter, _ := d.Counter.LoadOrStore(sessionInbound.Tag, counter.NewTrafficCounter())
 		t := storedCounter.(*counter.TrafficCounter)
 
@@ -423,6 +449,11 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		if !userlease.Allowed(user.Email) {
 			lm.CloseAll()
 			return errors.New("consumer authorization expired")
+		}
+		if _, active := limit.UserLimitInfo.Load(user.Email); !active {
+			common.Close(outbound.Writer)
+			common.Interrupt(outbound.Reader)
+			return errors.New("credential revoked during dispatch")
 		}
 		outbound.Writer = &dispatcher.SizeStatWriter{
 			Counter: downcounter,

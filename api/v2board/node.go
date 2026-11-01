@@ -13,6 +13,7 @@ import (
 
 	"encoding/json"
 
+	"github.com/wyx2685/v2node/common/rate"
 	"github.com/wyx2685/v2node/proxy/dynamicguard"
 )
 
@@ -34,11 +35,12 @@ type NodeInfo struct {
 }
 
 type CommonNode struct {
-	Protocol   string      `json:"protocol"`
-	ListenIP   string      `json:"listen_ip"`
-	ServerPort int         `json:"server_port"`
-	Routes     []Route     `json:"routes"`
-	BaseConfig *BaseConfig `json:"base_config"`
+	OrgBandwidthLimits map[int]rate.BandwidthLimit `json:"org_bandwidth_limits,omitempty"`
+	Protocol           string                      `json:"protocol"`
+	ListenIP           string                      `json:"listen_ip"`
+	ServerPort         int                         `json:"server_port"`
+	Routes             []Route                     `json:"routes"`
+	BaseConfig         *BaseConfig                 `json:"base_config"`
 	//vless vmess trojan
 	Tls                  int         `json:"tls"`
 	TlsSettings          TlsSettings `json:"tls_settings"`
@@ -67,20 +69,37 @@ type CommonNode struct {
 	SatlsSettings           *SatlsSettings `json:"satls_settings"`
 	//dynamicguard
 	DGSettings *DGNodeSettings `json:"dg_settings,omitempty"`
+	// Egress source addresses, one per family; empty lets the host choose, so
+	// a panel that never sends them (v2board) keeps the shared default outbound.
+	// With both families set the node gets an outbound per family and
+	// dual-stack destinations prefer IPv4.
+	EgressIPv4 string `json:"egress_ipv4,omitempty"`
+	EgressIPv6 string `json:"egress_ipv6,omitempty"`
+	// EgressFwmark is the SO_MARK put on every outbound socket this node opens,
+	// for policy routing on the host. Zero (or absent) leaves sockets unmarked.
+	EgressFwmark uint32 `json:"egress_fwmark,omitempty"`
 }
 
 type DGNodeSettings struct {
-	ServerWGKeyPath   string            `json:"server_wg_key_path"`
-	ServerWGPublicKey string            `json:"server_wg_public_key"`
-	LeaseTTL          uint32            `json:"lease_ttl"`
-	IPPools           map[string]string `json:"ip_pools"`
-	Routes            []string          `json:"routes"`
+	ServerWGKeyPath   string `json:"server_wg_key_path"`
+	ServerWGPublicKey string `json:"server_wg_public_key"`
+	LeaseTTL          uint32 `json:"lease_ttl"`
+	// NetworkOrgs maps each network id to its customer. Panels without
+	// customers (stock v2board) leave it and TenantPools out; the node is then
+	// one customer.
+	NetworkOrgs map[string]int    `json:"network_orgs"`
+	TenantPools map[string]string `json:"tenant_pools"`
+	IPPools     map[string]string `json:"ip_pools"`
+	Routes      []string          `json:"routes"`
 	// ACL is the server-enforced egress policy, keyed by network id exactly
 	// like ip_pools. It is never forwarded to clients.
-	ACL           map[string]dynamicguard.DGACL `json:"acl"`
-	CookieEnabled bool                          `json:"cookie_enabled"`
-	PowDifficulty uint8                         `json:"pow_difficulty"`
-	MTU           int                           `json:"mtu"`
+	ACL map[string]dynamicguard.DGACL `json:"acl"`
+	// NodeACL is the node's own egress policy, checked on its own ahead of
+	// every network's: a packet needs both to allow it. Absent means none.
+	NodeACL       *dynamicguard.DGACL `json:"node_acl,omitempty"`
+	CookieEnabled bool                `json:"cookie_enabled"`
+	PowDifficulty uint8               `json:"pow_difficulty"`
+	MTU           int                 `json:"mtu"`
 }
 
 type SatlsTLS struct {
@@ -112,10 +131,12 @@ type Route struct {
 }
 
 type BaseConfig struct {
-	PushInterval           any `json:"push_interval"`
-	PullInterval           any `json:"pull_interval"`
-	DeviceOnlineMinTraffic int `json:"device_online_min_traffic"`
-	NodeReportMinTraffic   int `json:"node_report_min_traffic"`
+	UsageSampling          bool `json:"usage_sampling"`
+	NodeEvents             bool `json:"node_events"`
+	PushInterval           any  `json:"push_interval"`
+	PullInterval           any  `json:"pull_interval"`
+	DeviceOnlineMinTraffic int  `json:"device_online_min_traffic"`
+	NodeReportMinTraffic   int  `json:"node_report_min_traffic"`
 	// AccessLogEnabled makes this node report one record per connection it
 	// carries. The panel sends the key only when it is on, so a node that never
 	// enables it keeps pulling a byte-identical configuration and never reloads
@@ -257,6 +278,9 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	node.PushInterval = intervalToTime(cm.BaseConfig.PushInterval)
 	node.PullInterval = intervalToTime(cm.BaseConfig.PullInterval)
 
+	if err := rate.ValidateBandwidthLimits(cm.OrgBandwidthLimits); err != nil {
+		return nil, err
+	}
 	node.Common = cm
 
 	return node, nil

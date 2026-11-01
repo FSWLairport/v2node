@@ -221,12 +221,13 @@ func (dt *DeviceTable) CleanExpired(ttl time.Duration) []ExpiredDevice {
 }
 
 // GroupIDByIP resolves a tunnel address to the network (group) whose pool
-// leased it. It reports false when no device currently holds the address.
+// leased it: the authenticated lease scope, never packet-supplied metadata.
+// It reports false when no live device holds the address.
 func (dt *DeviceTable) GroupIDByIP(ip netip.Addr) (int, bool) {
 	dt.mu.RLock()
 	defer dt.mu.RUnlock()
 	entry, ok := dt.byIP[ip]
-	if !ok {
+	if !ok || entry.Status == DeviceStatusRevoked || entry.Status == DeviceStatusDisconnected {
 		return 0, false
 	}
 	return entry.GroupID, true

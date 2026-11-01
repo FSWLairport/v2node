@@ -25,6 +25,7 @@ type OnlineUser struct {
 }
 
 type UserInfo struct {
+	OrgID                 int                `json:"org_id,omitempty" msgpack:"org_id,omitempty"`
 	GrantBandwidthLimits  []grantlimit.Limit `json:"grant_bandwidth_limits,omitempty" msgpack:"grant_bandwidth_limits,omitempty"`
 	ConsumerAccountID     int                `json:"consumer_account_id,omitempty" msgpack:"consumer_account_id,omitempty"`
 	ConsumerLeaseID       string             `json:"consumer_lease_id,omitempty" msgpack:"consumer_lease_id,omitempty"`
@@ -216,13 +217,16 @@ func (c *Client) ReportUserTraffic(ctx context.Context, userTraffic []UserTraffi
 		data[userTraffic[i].UID] = []int64{userTraffic[i].Upload, userTraffic[i].Download}
 	}
 	const path = "/api/v1/server/UniProxy/push"
-	_, err := c.client.R().
+	r, err := c.client.R().
 		SetContext(ctx).
 		SetBody(data).
 		ForceContentType("application/json").
 		Post(path)
 	if err != nil {
 		return err
+	}
+	if r == nil || r.StatusCode() < 200 || r.StatusCode() >= 300 {
+		return fmt.Errorf("traffic report was rejected")
 	}
 	return nil
 }

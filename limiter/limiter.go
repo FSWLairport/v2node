@@ -20,6 +20,8 @@ func Init() {
 
 type Limiter struct {
 	access        sync.Mutex
+	OrgLimiter    *rate.OrganizationLimiter
+	OrgIDs        sync.Map       // TagUUID -> authenticated organization ID
 	Nodetype      string         // Node type, e.g. "v2ray", "trojan", "shadowsocks"
 	SpeedLimit    int            // Node speed limit in Mbps
 	UserOnlineIP  *sync.Map      // Key: TagUUID, value: {Key: Ip, value: Uid}
@@ -51,6 +53,7 @@ func AddLimiter(nodetype string, tag string, users []panel.UserInfo, aliveList m
 	uuidmap := make(map[string]int)
 	for i := range users {
 		uuidmap[users[i].Uuid] = users[i].Id
+		l.OrgIDs.Store(format.UserTag(tag, users[i].Uuid), users[i].OrgID)
 		userLimit := &UserLimitInfo{}
 		userLimit.UID = users[i].Id
 		if users[i].SpeedLimit != 0 {
@@ -90,12 +93,14 @@ func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel
 	defer l.access.Unlock()
 	for i := range deleted {
 		l.UserLimitInfo.Delete(format.UserTag(tag, deleted[i].Uuid))
+		l.OrgIDs.Delete(format.UserTag(tag, deleted[i].Uuid))
 		l.UserOnlineIP.Delete(format.UserTag(tag, deleted[i].Uuid))
 		l.SpeedLimiter.Delete(format.UserTag(tag, deleted[i].Uuid))
 		delete(l.UUIDtoUID, deleted[i].Uuid)
 		delete(l.AliveList, deleted[i].Id)
 	}
 	for i := range modified {
+		l.OrgIDs.Store(format.UserTag(tag, modified[i].Uuid), modified[i].OrgID)
 		if v, ok := l.UserLimitInfo.Load(format.UserTag(tag, modified[i].Uuid)); ok {
 			u := v.(*UserLimitInfo)
 			u.SpeedLimit = modified[i].SpeedLimit
@@ -116,6 +121,7 @@ func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel
 		}
 	}
 	for i := range added {
+		l.OrgIDs.Store(format.UserTag(tag, added[i].Uuid), added[i].OrgID)
 		userLimit := &UserLimitInfo{
 			UID: added[i].Id,
 		}
@@ -215,8 +221,8 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, noUDPsource bool) (Dynam
 			return v.(*rate.DynamicBucket), false
 		} else {
 			d := rate.NewDynamicBucket(limit)
-			l.SpeedLimiter.Store(taguuid, d)
-			return d, false
+			actual, _ := l.SpeedLimiter.LoadOrStore(taguuid, d)
+			return actual.(*rate.DynamicBucket), false
 		}
 	} else {
 		return nil, false
@@ -254,4 +260,11 @@ func (l *Limiter) SetAliveList(alive map[int]int) {
 	l.access.Lock()
 	defer l.access.Unlock()
 	l.AliveList = alive
+}
+
+func (l *Limiter) OrganizationBuckets(taguuid string) (up, down *rate.DynamicBucket) {
+	if org, ok := l.OrgIDs.Load(taguuid); ok {
+		return l.OrgLimiter.Buckets(org.(int))
+	}
+	return nil, nil
 }

@@ -143,3 +143,15 @@ func TestLatchDoesNotAffectTheFrozenReports(t *testing.T) {
 		t.Fatalf("frozen reports sent %d times, want 4", pushes)
 	}
 }
+
+func TestEmptyTrafficReportRecordsAnIdleSamplingInterval(t *testing.T) {
+	body := captureReport(t, "/api/v1/server/UniProxy/push", http.StatusOK, func(client *Client) error { return client.ReportUserTraffic(context.Background(), nil) })
+	if body == nil || len(body) != 0 {
+		t.Fatalf("idle sampling body=%v", body)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) }))
+	defer server.Close()
+	if err := newPanelTestClient(t, server.URL).ReportUserTraffic(context.Background(), nil); err == nil {
+		t.Fatal("failed sampling report was treated as success")
+	}
+}

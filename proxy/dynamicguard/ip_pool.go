@@ -11,7 +11,8 @@ type IPPool struct {
 	base    netip.Addr // 网络地址 + 1 (跳过网络地址)
 	size    uint32     // 可用地址数
 	bitmap  []uint64   // 位图追踪已分配地址
-	mu      sync.Mutex
+	mu      *sync.Mutex
+	used    map[netip.Addr]*IPPool
 }
 
 // NewIPPool 从 CIDR 字符串创建 IP 地址池
@@ -53,6 +54,7 @@ func NewIPPool(cidr string) (*IPPool, error) {
 		base:    base,
 		size:    size,
 		bitmap:  make([]uint64, bitmapLen),
+		mu:      &sync.Mutex{}, used: map[netip.Addr]*IPPool{},
 	}, nil
 }
 
@@ -71,7 +73,8 @@ func (p *IPPool) Allocate() (netip.Addr, error) {
 			if idx >= p.size {
 				return netip.Addr{}, errIPPoolExhausted
 			}
-			if p.bitmap[i]&(1<<bit) == 0 {
+			if p.bitmap[i]&(1<<bit) == 0 && p.used[p.addrAtIndex(idx)] == nil {
+				p.used[p.addrAtIndex(idx)] = p
 				p.bitmap[i] |= 1 << bit
 				return p.addrAtIndex(idx), nil
 			}
@@ -91,11 +94,33 @@ func (p *IPPool) Reserve(ip netip.Addr) bool {
 	}
 	word := idx / 64
 	bit := idx % 64
-	if p.bitmap[word]&(1<<bit) != 0 {
+	if p.bitmap[word]&(1<<bit) != 0 || p.used[ip] != nil {
 		return false // 已被占用
 	}
+	p.used[ip] = p
 	p.bitmap[word] |= 1 << bit
 	return true
+}
+
+// ReservePrefix excludes a tenant reservation from this pool view, including the whole pool.
+func (p *IPPool) ReservePrefix(sub netip.Prefix) {
+	sub = sub.Masked()
+	if !p.network.Overlaps(sub) {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	start, ok := p.indexOf(sub.Addr())
+	if !ok {
+		// 子网的网络地址就是本池的网络地址（base 之前一位），从 0 开始。
+		start = 0
+	}
+	for idx := start; idx < p.size; idx++ {
+		if !sub.Contains(p.addrAtIndex(idx)) {
+			break
+		}
+		p.bitmap[idx/64] |= 1 << (idx % 64)
+	}
 }
 
 // Release 释放 IP 地址
@@ -107,6 +132,10 @@ func (p *IPPool) Release(ip netip.Addr) {
 	if !ok {
 		return
 	}
+	if p.used[ip] != p {
+		return
+	}
+	delete(p.used, ip)
 	word := idx / 64
 	bit := idx % 64
 	p.bitmap[word] &^= 1 << bit

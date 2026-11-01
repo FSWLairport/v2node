@@ -108,7 +108,7 @@ func TestConsumerKernelTUNEncryptedTrafficExpires(t *testing.T) {
 	defer userlease.Revoke(tag)
 	users.Update([]*UserEntry{{UserID: 1, UserKey: [32]byte{1}, LeaseTag: tag}, {UserID: 2, UserKey: [32]byte{2}}})
 	table := NewDeviceTable()
-	server, err := NewWGDevice(&WGDeviceConfig{PrivateKey: private, MTU: 1408, UDPConn: udp, TunnelAddrs: []netip.Addr{serverIP}, Prefixes: []netip.Prefix{netip.MustParsePrefix("10.77.91.0/24")}, Params: params, DeviceTable: table, UserKeys: users})
+	server, err := NewWGDevice(&WGDeviceConfig{PrivateKey: private, MTU: 1408, UDPConn: udp, TunnelAddrs: []netip.Addr{serverIP}, Prefixes: []netip.Prefix{netip.MustParsePrefix("10.77.91.0/24")}, Params: params, DeviceTable: table, UserKeys: users, ACL: newACLPolicy(nil, nil, nil, nil)})
 	if err != nil {
 		t.Fatal(err)
 	}

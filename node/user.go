@@ -24,6 +24,10 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		reportmin = c.info.Common.BaseConfig.NodeReportMinTraffic
 		devicemin = c.info.Common.BaseConfig.DeviceOnlineMinTraffic
 	}
+	usageSampling := c.info.Common.BaseConfig != nil && c.info.Common.BaseConfig.UsageSampling
+	if usageSampling {
+		reportmin = 0
+	}
 	c.usersMu.Lock()
 	snapshotErr := c.snapshotTrafficLocked(false)
 	userTraffic := c.drainLegacyTrafficLocked(reportmin)
@@ -31,7 +35,7 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 	if snapshotErr != nil {
 		log.WithField("tag", c.tag).WithError(snapshotErr).Warn("Consumer snapshot deferred")
 	}
-	if len(userTraffic) > 0 {
+	if len(userTraffic) > 0 || usageSampling {
 		err = c.apiClient.ReportUserTraffic(ctx, userTraffic)
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -41,7 +45,7 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
-		} else {
+		} else if len(userTraffic) > 0 {
 			log.WithField("tag", c.tag).Infof("Report %d users traffic", len(userTraffic))
 			//log.WithField("tag", c.tag).Debugf("User traffic: %+v", userTraffic)
 		}
@@ -100,7 +104,7 @@ func (c *Controller) reportDGTraffic(ctx context.Context) error {
 	if snapshotErr != nil {
 		log.WithField("tag", c.tag).WithError(snapshotErr).Warn("Consumer snapshot deferred")
 	}
-	if len(userTraffic) == 0 {
+	if len(userTraffic) == 0 && (c.info.Common.BaseConfig == nil || !c.info.Common.BaseConfig.UsageSampling) {
 		return nil
 	}
 
@@ -110,7 +114,7 @@ func (c *Controller) reportDGTraffic(ctx context.Context) error {
 			"tag": c.tag,
 			"err": err,
 		}).Info("Report DG user traffic failed")
-	} else {
+	} else if len(userTraffic) > 0 {
 		log.WithField("tag", c.tag).Infof("Report %d DG users traffic", len(userTraffic))
 	}
 	return nil
@@ -226,7 +230,7 @@ func compareUserList(old, new []panel.UserInfo) (deleted, added, modified []pane
 				delete(oldMap, u.Uuid)
 				continue
 			}
-			if o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit {
+			if o.OrgID != u.OrgID || o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit {
 				modified = append(modified, u)
 			}
 			delete(oldMap, u.Uuid)

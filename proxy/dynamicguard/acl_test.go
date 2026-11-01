@@ -112,12 +112,23 @@ func wantDsts(t *testing.T, inner *fakeTUN, want ...string) {
 	}
 }
 
-// TestACLWireShape pins the payload shape the panel sends: "acl" sits next to
-// "ip_pools" and is keyed by the same network ids.
+// strictPolicy compiles acl for a multi-tenant panel where customer 1 owns
+// every listed network, so a network absent from acl stays denied.
+func strictPolicy(acl map[string]DGACL) *aclPolicy {
+	orgs := make(map[string]int, len(acl))
+	for group := range acl {
+		orgs[group] = 1
+	}
+	return newACLPolicy(acl, nil, orgs, nil)
+}
+
+// TestACLWireShape pins the payload shape the panel sends: "acl" and
+// "network_orgs" sit next to "ip_pools" and are keyed by the same network ids.
 func TestACLWireShape(t *testing.T) {
 	const payload = `{
 	  "server_wg_key_path": "/k", "server_wg_public_key": "p", "lease_ttl": 3600,
 	  "ip_pools": {"12": "100.64.0.0/16", "13": "100.64.0.0/16"},
+	  "network_orgs": {"12": 1, "13": 1},
 	  "routes": ["0.0.0.0/0"],
 	  "acl": {
 	    "12": {"default": "allow", "rules": [{"action": "deny", "cidr": "169.254.169.254/32"}]},
@@ -129,14 +140,14 @@ func TestACLWireShape(t *testing.T) {
 	if err := json.Unmarshal([]byte(payload), &settings); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if settings.ACL["12"].Default != "allow" || settings.ACL["12"].Rules[0].CIDR != "169.254.169.254/32" {
+	if settings.NetworkOrgs["12"] != 1 || settings.ACL["12"].Default != "allow" || settings.ACL["12"].Rules[0].CIDR != "169.254.169.254/32" {
 		t.Fatalf("network 12 decoded as %+v", settings.ACL["12"])
 	}
 	if settings.ACL["13"].Default != "deny" || settings.ACL["13"].Rules[0].Action != "allow" {
 		t.Fatalf("network 13 decoded as %+v", settings.ACL["13"])
 	}
 
-	policy := newACLPolicy(settings.ACL)
+	policy := newACLPolicy(settings.ACL, nil, settings.NetworkOrgs, nil)
 	if policy.allows(12, netip.MustParseAddr("169.254.169.254")) {
 		t.Fatal("metadata endpoint allowed for network 12")
 	}
@@ -145,30 +156,23 @@ func TestACLWireShape(t *testing.T) {
 	}
 }
 
-func TestACLPolicyAllAllowIsDisabled(t *testing.T) {
-	// Absent ACL and an all-allow ACL must both compile to "no enforcement",
-	// so an upgraded node behaves exactly like today.
-	if p := newACLPolicy(nil); p != nil {
-		t.Fatal("nil ACL should compile to no policy")
-	}
-	if p := newACLPolicy(map[string]DGACL{"12": {Default: "allow"}}); p != nil {
-		t.Fatal("allow with no rules should compile to no policy")
-	}
-
+func TestACLAllAllowStillRequiresIdentity(t *testing.T) {
 	inner := &fakeTUN{}
-	a := newACLTUN(inner, NewDeviceTable(), nil, false)
-	// No leases registered either: without a policy nothing is inspected.
-	writeAll(t, a, v4Packet("100.64.0.5", "169.254.169.254"))
-	wantDsts(t, inner, "169.254.169.254")
-	if a.Dropped() != 0 {
-		t.Fatalf("dropped %d packets without a policy", a.Dropped())
+	a := newACLTUN(inner, NewDeviceTable(), strictPolicy(map[string]DGACL{"12": {Default: "allow"}}), false)
+	writeAll(t, a, v4Packet("100.64.0.5", "8.8.8.8"))
+	wantDsts(t, inner)
+	if a.Dropped() != 1 {
+		t.Fatal("unknown source bypassed isolation")
 	}
+	a.SetPolicy(nil)
+	writeAll(t, a, v4Packet("100.64.0.5", "8.8.8.8"))
+	wantDsts(t, inner)
 }
 
 func TestACLDefaultAllowWithDenyRules(t *testing.T) {
 	inner := &fakeTUN{}
 	dt := leaseTable(t, map[string]int{"100.64.0.5": 12})
-	policy := newACLPolicy(map[string]DGACL{"12": {
+	policy := strictPolicy(map[string]DGACL{"12": {
 		Default: "allow",
 		Rules: []DGACLRule{
 			{Action: "deny", CIDR: "169.254.169.254/32"},
@@ -192,7 +196,7 @@ func TestACLDefaultAllowWithDenyRules(t *testing.T) {
 func TestACLDefaultDenyWithAllowException(t *testing.T) {
 	inner := &fakeTUN{}
 	dt := leaseTable(t, map[string]int{"100.64.0.9": 13})
-	policy := newACLPolicy(map[string]DGACL{"13": {
+	policy := strictPolicy(map[string]DGACL{"13": {
 		Default: "deny",
 		Rules:   []DGACLRule{{Action: "allow", CIDR: "192.168.7.0/24"}},
 	}})
@@ -209,7 +213,7 @@ func TestACLDefaultDenyWithAllowException(t *testing.T) {
 func TestACLFirstMatchWins(t *testing.T) {
 	inner := &fakeTUN{}
 	dt := leaseTable(t, map[string]int{"100.64.0.5": 12})
-	policy := newACLPolicy(map[string]DGACL{"12": {
+	policy := strictPolicy(map[string]DGACL{"12": {
 		Default: "deny",
 		Rules: []DGACLRule{
 			{Action: "allow", CIDR: "10.0.0.0/24"},
@@ -228,7 +232,7 @@ func TestACLFirstMatchWins(t *testing.T) {
 func TestACLIPv6(t *testing.T) {
 	inner := &fakeTUN{}
 	dt := leaseTable(t, map[string]int{"fd00::5": 12})
-	policy := newACLPolicy(map[string]DGACL{"12": {
+	policy := strictPolicy(map[string]DGACL{"12": {
 		Default: "allow",
 		Rules: []DGACLRule{
 			{Action: "deny", CIDR: "fd00:dead::/32"},
@@ -248,7 +252,7 @@ func TestACLIPv6(t *testing.T) {
 func TestACLMalformedPacketsDropped(t *testing.T) {
 	inner := &fakeTUN{}
 	dt := leaseTable(t, map[string]int{"100.64.0.5": 12})
-	policy := newACLPolicy(map[string]DGACL{"12": {Default: "deny"}})
+	policy := strictPolicy(map[string]DGACL{"12": {Default: "deny"}})
 	a := newACLTUN(inner, dt, policy, false)
 
 	short := make([]byte, testOffset+10)
@@ -271,7 +275,7 @@ func TestACLPerNetworkSelection(t *testing.T) {
 	// Both networks share one CIDR, so only the lease's group can tell them
 	// apart; the ACL must never be unioned across networks.
 	dt := leaseTable(t, map[string]int{"100.64.0.5": 12, "100.64.0.6": 13})
-	policy := newACLPolicy(map[string]DGACL{
+	policy := strictPolicy(map[string]DGACL{
 		"12": {Default: "allow", Rules: []DGACLRule{{Action: "deny", CIDR: "10.10.0.0/16"}}},
 		"13": {Default: "deny", Rules: []DGACLRule{{Action: "allow", CIDR: "10.10.0.0/16"}}},
 	})
@@ -290,10 +294,10 @@ func TestACLPerNetworkSelection(t *testing.T) {
 	}
 }
 
-func TestACLNetworkWithoutConfigIsUnfiltered(t *testing.T) {
+func TestACLNetworkWithoutConfigIsDenied(t *testing.T) {
 	inner := &fakeTUN{}
 	dt := leaseTable(t, map[string]int{"100.64.0.5": 12, "100.64.0.6": 99})
-	policy := newACLPolicy(map[string]DGACL{
+	policy := strictPolicy(map[string]DGACL{
 		"12": {Default: "deny"},
 	})
 	a := newACLTUN(inner, dt, policy, false)
@@ -302,15 +306,15 @@ func TestACLNetworkWithoutConfigIsUnfiltered(t *testing.T) {
 		v4Packet("100.64.0.5", "8.8.8.8"),
 		v4Packet("100.64.0.6", "8.8.8.8"),
 	)
-	if len(inner.written) != 1 {
-		t.Fatalf("forwarded %d packets, want 1", len(inner.written))
+	if len(inner.written) != 0 {
+		t.Fatalf("forwarded %d packets, want 0", len(inner.written))
 	}
 }
 
 func TestACLUnknownValuesDeny(t *testing.T) {
 	inner := &fakeTUN{}
 	dt := leaseTable(t, map[string]int{"100.64.0.5": 12})
-	policy := newACLPolicy(map[string]DGACL{"12": {
+	policy := strictPolicy(map[string]DGACL{"12": {
 		Default: "banana",
 		Rules:   []DGACLRule{{Action: "maybe", CIDR: "8.8.8.0/24"}},
 	}})
@@ -331,7 +335,7 @@ func TestACLUnknownValuesDeny(t *testing.T) {
 func TestACLPolicySwapTakesEffect(t *testing.T) {
 	inner := &fakeTUN{}
 	dt := leaseTable(t, map[string]int{"100.64.0.5": 12})
-	a := newACLTUN(inner, dt, newACLPolicy(map[string]DGACL{
+	a := newACLTUN(inner, dt, strictPolicy(map[string]DGACL{
 		"12": {Default: "allow", Rules: []DGACLRule{{Action: "deny", CIDR: "10.0.0.0/8"}}},
 	}), false)
 
@@ -340,16 +344,16 @@ func TestACLPolicySwapTakesEffect(t *testing.T) {
 		t.Fatal("packet passed a deny rule")
 	}
 
-	a.SetPolicy(newACLPolicy(map[string]DGACL{
+	a.SetPolicy(strictPolicy(map[string]DGACL{
 		"12": {Default: "allow", Rules: []DGACLRule{{Action: "allow", CIDR: "10.0.0.0/8"}}},
 	}))
 	writeAll(t, a, v4Packet("100.64.0.5", "10.0.0.1"))
 	wantDsts(t, inner, "10.0.0.1")
 
-	// Clearing the policy restores the unfiltered fast path.
+	// Clearing the policy must fail closed.
 	a.SetPolicy(nil)
 	writeAll(t, a, v4Packet("100.64.0.5", "10.0.0.1"))
-	wantDsts(t, inner, "10.0.0.1", "10.0.0.1")
+	wantDsts(t, inner, "10.0.0.1")
 }
 
 func TestACLAllAllowedSkipsCopy(t *testing.T) {
@@ -357,7 +361,7 @@ func TestACLAllAllowedSkipsCopy(t *testing.T) {
 	// device untouched, which is what keeps the hot path allocation free.
 	inner := &fakeTUN{countOnly: true}
 	dt := leaseTable(t, map[string]int{"100.64.0.5": 12})
-	a := newACLTUN(inner, dt, newACLPolicy(map[string]DGACL{
+	a := newACLTUN(inner, dt, strictPolicy(map[string]DGACL{
 		"12": {Default: "allow", Rules: []DGACLRule{{Action: "deny", CIDR: "10.0.0.0/8"}}},
 	}), false)
 
@@ -372,5 +376,33 @@ func TestACLAllAllowedSkipsCopy(t *testing.T) {
 	}
 	if inner.calls == 0 {
 		t.Fatal("inner device never called")
+	}
+}
+
+// The node's table is checked on its own: a network that allows everything
+// cannot widen a node restricted to one range, and a node that allows
+// everything cannot widen a network's deny.
+func TestNodeACLIsCheckedSeparately(t *testing.T) {
+	policy := newACLPolicy(map[string]DGACL{
+		"12": {Default: "allow"},
+		"13": {Default: "allow", Rules: []DGACLRule{{Action: "deny", CIDR: "10.1.2.0/24"}}},
+	}, &DGACL{Default: "deny", Rules: []DGACLRule{{Action: "allow", CIDR: "10.1.0.0/16"}}}, map[string]int{"12": 1, "13": 1}, nil)
+	for _, c := range []struct {
+		group int
+		dst   string
+		want  bool
+	}{
+		{12, "10.1.3.4", true},  // both allow
+		{12, "8.8.8.8", false},  // the network allows, the node does not
+		{13, "10.1.2.3", false}, // the node allows, the network does not
+		{13, "10.1.9.9", true},
+	} {
+		if got := policy.allows(c.group, netip.MustParseAddr(c.dst)); got != c.want {
+			t.Fatalf("network %d to %s: allowed=%v, want %v", c.group, c.dst, got, c.want)
+		}
+	}
+	var settings DGSettings
+	if err := json.Unmarshal([]byte(`{"node_acl": {"default": "deny", "rules": [{"action": "allow", "cidr": "10.1.0.0/16"}]}}`), &settings); err != nil || settings.NodeACL == nil || settings.NodeACL.Rules[0].CIDR != "10.1.0.0/16" {
+		t.Fatalf("node_acl decoded as %+v: %v", settings.NodeACL, err)
 	}
 }

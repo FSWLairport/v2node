@@ -12,6 +12,7 @@ import (
 	"github.com/wyx2685/v2node/common/format"
 	"github.com/wyx2685/v2node/common/userlease"
 	"github.com/wyx2685/v2node/core/app/dispatcher"
+	"github.com/wyx2685/v2node/limiter"
 	"github.com/wyx2685/v2node/proxy/satls"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
@@ -53,6 +54,7 @@ func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo
 	if err != nil {
 		return fmt.Errorf("get user manager error: %s", err)
 	}
+	userLimit, _ := limiter.GetLimiter(tag)
 	var user string
 	vc.users.mapLock.Lock()
 	defer vc.users.mapLock.Unlock()
@@ -60,6 +62,10 @@ func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo
 		user = format.UserTag(tag, users[i].Uuid)
 		if vc.users.uidMap[user] == 0 {
 			continue
+		}
+		// Fence new dispatches before closing links; already authenticated SMUX sessions can open more streams.
+		if userLimit != nil {
+			userLimit.UserLimitInfo.Delete(user)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err = userManager.RemoveUser(ctx, user)

@@ -35,7 +35,7 @@ func TestConsumerDataPlaneLeaseGatesBothDirections(t *testing.T) {
 		}
 	}
 	inner := &readTUN{}
-	a := newACLTUN(inner, dt, nil, false)
+	a := newACLTUN(inner, dt, newACLPolicy(nil, nil, nil, nil), false)
 	a.users = users
 	writeAll(t, a, v4Packet("100.64.0.5", "8.8.8.8"))
 	if len(inner.written) != 1 {
@@ -74,7 +74,7 @@ func TestConsumerACLDropDoesNotConsumeQuota(t *testing.T) {
 	userlease.Set(tag, time.Now().Add(time.Minute), nil)
 	users := NewUserKeyMap()
 	users.Update([]*UserEntry{{UserID: 1, LeaseTag: tag}})
-	a := newACLTUN(&fakeTUN{}, leaseTable(t, map[string]int{"100.64.0.5": 12}), newACLPolicy(map[string]DGACL{"12": {Default: "deny"}}), false)
+	a := newACLTUN(&fakeTUN{}, leaseTable(t, map[string]int{"100.64.0.5": 12}), newACLPolicy(map[string]DGACL{"12": {Default: "deny"}}, nil, nil, nil), false)
 	a.users = users
 	writeAll(t, a, v4Packet("100.64.0.5", "8.8.8.8"))
 	if len(a.collectConsumerTraffic()) != 0 {
@@ -90,11 +90,11 @@ func TestConsumerClientInitRejectsMismatchedDevicePins(t *testing.T) {
 	}
 	for _, kind := range []string{"device", "key"} {
 		t.Run(kind, func(t *testing.T) {
-			u := &UserEntry{UserID: 1, UserKey: msg.UserKey, Pinned: true, PinnedDeviceID: msg.DeviceID, PinnedWGKey: msg.WGStaticPub}
+			u := &UserEntry{UserID: 1, UserKey: msg.UserKey, Pinned: true, DeviceID: msg.DeviceID, WGStaticPub: msg.WGStaticPub}
 			if kind == "device" {
-				u.PinnedDeviceID[0] ^= 1
+				u.DeviceID[0] ^= 1
 			} else {
-				u.PinnedWGKey[0] ^= 1
+				u.WGStaticPub[0] ^= 1
 			}
 			users := NewUserKeyMap()
 			users.Update([]*UserEntry{u})

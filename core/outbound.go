@@ -1,9 +1,8 @@
 package core
 
 import (
-	"fmt"
-
 	"encoding/json"
+	"fmt"
 
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf"
@@ -26,6 +25,27 @@ func buildDefaultOutbound() (*core.OutboundHandlerConfig, error) {
 		return nil, fmt.Errorf("marshal proxy config error: %s", err)
 	}
 	outboundDetourConfig.Settings = &setting
+	return outboundDetourConfig.Build()
+}
+
+// buildEgressOutbound is one node's own freedom outbound: traffic leaves from
+// sendThrough (a specific address, "" for the host's choice) and, when asked,
+// carries a fwmark for policy routing. domainStrategy narrows a per-family
+// outbound to its family.
+func buildEgressOutbound(tag, sendThrough, domainStrategy string, fwmark uint32) (*core.OutboundHandlerConfig, error) {
+	outboundDetourConfig := &conf.OutboundDetourConfig{Protocol: "freedom", Tag: tag}
+	if sendThrough != "" {
+		outboundDetourConfig.SendThrough = &sendThrough
+	}
+	if fwmark != 0 {
+		outboundDetourConfig.StreamSetting = &conf.StreamConfig{SocketSettings: &conf.SocketConfig{Mark: int32(fwmark)}}
+	}
+	setting, err := json.Marshal(&conf.FreedomConfig{DomainStrategy: domainStrategy})
+	if err != nil {
+		return nil, fmt.Errorf("marshal proxy config error: %s", err)
+	}
+	raw := json.RawMessage(setting)
+	outboundDetourConfig.Settings = &raw
 	return outboundDetourConfig.Build()
 }
 

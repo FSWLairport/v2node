@@ -12,12 +12,14 @@ import (
 
 func (c *Controller) startTasks(node *panel.NodeInfo) {
 	c.startConsumerTasks()
+	wake := make(chan struct{}, 1)
 	// fetch node info task
 	c.nodeInfoMonitorPeriodic = &task.Task{
 		Name:     "nodeInfoMonitor",
 		Interval: node.PullInterval,
 		Execute:  c.nodeInfoMonitor,
 		ReloadCh: c.server.ReloadCh,
+		Wake:     wake,
 	}
 	// fetch user list task
 	c.userReportPeriodic = &task.Task{
@@ -29,6 +31,15 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 	log.WithField("tag", c.tag).Info("Start monitor node status")
 	// delay to start nodeInfoMonitor
 	_ = c.nodeInfoMonitorPeriodic.Start(false)
+	if node.Common.BaseConfig.NodeEvents {
+		ctx, cancel := context.WithCancel(context.Background())
+		c.eventsCancel = cancel
+		c.eventsDone = make(chan struct{})
+		go func() {
+			defer close(c.eventsDone)
+			c.apiClient.WatchEvents(ctx, wake)
+		}()
+	}
 	log.WithField("tag", c.tag).Info("Start report node status")
 	_ = c.userReportPeriodic.Start(false)
 	if node.Security == panel.Tls {

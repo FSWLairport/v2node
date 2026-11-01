@@ -6,11 +6,13 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/wyx2685/v2node/common/rate"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -19,21 +21,27 @@ type DGSettings struct {
 	ServerWGKeyPath   string            `json:"server_wg_key_path"`
 	ServerWGPublicKey string            `json:"server_wg_public_key"`
 	LeaseTTL          uint32            `json:"lease_ttl"`
-	IPPools           map[string]string `json:"ip_pools"` // group_id(string) -> CIDR
+	NetworkOrgs       map[string]int    `json:"network_orgs"` // group_id(string) -> org; empty together with tenant_pools means a panel without customers
+	TenantPools       map[string]string `json:"tenant_pools"` // org -> reserved CIDR, including tenants without attached networks
+	IPPools           map[string]string `json:"ip_pools"`     // group_id(string) -> CIDR
 	// Routes 只是客户端分流配置（哪些目标送进隧道），服务端不据此过滤。
 	Routes []string `json:"routes"`
 	// ACL 是服务端强制的出网策略，按网络（group_id 字符串）区分，绝不做并集，
 	// 也绝不下发给客户端。
-	ACL           map[string]DGACL `json:"acl"`
-	CookieEnabled bool             `json:"cookie_enabled"`
-	PowDifficulty uint8            `json:"pow_difficulty"`
-	MTU           int              `json:"mtu"`
+	ACL map[string]DGACL `json:"acl"`
+	// NodeACL 是节点自身的出网策略，与各网络的 ACL 分开判断：两者都放行才转发。
+	// 缺省表示节点不另加限制。
+	NodeACL       *DGACL `json:"node_acl,omitempty"`
+	CookieEnabled bool   `json:"cookie_enabled"`
+	PowDifficulty uint8  `json:"pow_difficulty"`
+	MTU           int    `json:"mtu"`
 }
 
 // DGServerConfig 服务端完整配置
 type DGServerConfig struct {
-	ListenAddr string
-	DGSettings *DGSettings
+	OrgBandwidthLimits map[int]rate.BandwidthLimit
+	ListenAddr         string
+	DGSettings         *DGSettings
 	// AccessLogEnabled comes from base_config, not from dg_settings: the panel
 	// offers the same switch for both protocols.
 	AccessLogEnabled bool
@@ -80,6 +88,9 @@ const pingQueueSize = 1024
 
 // NewDGServer 创建 DG 服务端
 func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
+	if err := rate.ValidateBandwidthLimits(cfg.OrgBandwidthLimits); err != nil {
+		return nil, err
+	}
 	settings := cfg.DGSettings
 	if settings.PowDifficulty > 24 {
 		return nil, fmt.Errorf("pow_difficulty must be between 0 and 24")
@@ -120,23 +131,12 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		return nil, err
 	}
 
-	// 创建 IP 池（相同 CIDR 的多个 group 共享同一实例，避免重叠分配）
-	cidrToPool := make(map[string]*IPPool)
-	ipPools := make(map[int]*IPPool)
-	for groupStr, cidr := range settings.IPPools {
-		groupID := 0
-		fmt.Sscanf(groupStr, "%d", &groupID)
-		pool, exists := cidrToPool[cidr]
-		if !exists {
-			var err error
-			pool, err = NewIPPool(cidr)
-			if err != nil {
-				return nil, fmt.Errorf("create IP pool for group %s (%s): %w", groupStr, cidr, err)
-			}
-			cidrToPool[cidr] = pool
-		}
-		ipPools[groupID] = pool
-		log.Infof("[DynamicGuard] IP pool group=%d cidr=%s", groupID, cidr)
+	ipPools, cidrToPool, err := buildIPPools(settings)
+	if err != nil {
+		return nil, err
+	}
+	if isSingleTenant(settings.NetworkOrgs, settings.TenantPools) {
+		log.Info("[DynamicGuard] panel sent no customers, running as a single tenant")
 	}
 
 	// 绑定 UDP 端口
@@ -159,19 +159,36 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 		return nil, fmt.Errorf("enable pktinfo: %w", err)
 	}
 
-	// 收集所有 IP 池的网关地址和子网前缀（按 CIDR 去重，共享池只处理一次）
+	// 所有视图共享地址占用记录；嵌套范围不需要在同客户的父池中整段排除。
+	// 只给根池（不被任何池包含）绑网关地址：父池那条 connected route 已经覆盖
+	// 全部子池，子池再绑地址只是白烧一个 IP。
+	distinctPools := make([]*IPPool, 0, len(cidrToPool))
+	for _, pool := range cidrToPool {
+		distinctPools = append(distinctPools, pool)
+	}
+	rootPools := make([]*IPPool, 0, len(distinctPools))
+	for _, pool := range distinctPools {
+		nested := false
+		for _, other := range distinctPools {
+			if other == pool || !other.network.Contains(pool.network.Addr()) || other.network.Bits() >= pool.network.Bits() {
+				continue
+			}
+			nested = true
+		}
+		if !nested {
+			rootPools = append(rootPools, pool)
+		}
+	}
+	sort.Slice(rootPools, func(i, j int) bool { return rootPools[i].network.Addr().Less(rootPools[j].network.Addr()) })
+
+	// 收集根池的网关地址和子网前缀
 	var tunnelAddrs []netip.Addr
 	var ipPrefixes []netip.Prefix
-	seenPool := make(map[*IPPool]struct{})
-	for _, pool := range ipPools {
-		if _, dup := seenPool[pool]; dup {
-			continue
-		}
-		seenPool[pool] = struct{}{}
+	for _, pool := range rootPools {
 		gwAddr := pool.network.Addr().Next()
 		tunnelAddrs = append(tunnelAddrs, gwAddr)
 		ipPrefixes = append(ipPrefixes, pool.network)
-		pool.Reserve(gwAddr)
+		pool.used[gwAddr] = pool
 		log.WithFields(log.Fields{
 			"gateway": gwAddr.String(),
 			"network": pool.network.String(),
@@ -205,15 +222,17 @@ func NewDGServer(cfg *DGServerConfig) (*DGServer, error) {
 
 	// 创建 WG 设备（使用内核 TUN，自动配置系统路由和 NAT）
 	wgDevice, err := NewWGDevice(&WGDeviceConfig{
-		PrivateKey:  serverWGPriv,
-		MTU:         settings.MTU,
-		UDPConn:     udpConn,
-		TunnelAddrs: tunnelAddrs,
-		Prefixes:    ipPrefixes,
-		Params:      awgParams,
-		DeviceTable: deviceTable,
-		UserKeys:    userKeyMap,
-		ACL:         newACLPolicy(settings.ACL),
+		PrivateKey:         serverWGPriv,
+		MTU:                settings.MTU,
+		UDPConn:            udpConn,
+		TunnelAddrs:        tunnelAddrs,
+		Prefixes:           ipPrefixes,
+		Params:             awgParams,
+		DeviceTable:        deviceTable,
+		NetworkOrgs:        settings.NetworkOrgs,
+		OrgBandwidthLimits: cfg.OrgBandwidthLimits,
+		ACL:                newACLPolicy(settings.ACL, settings.NodeACL, settings.NetworkOrgs, settings.TenantPools),
+		UserKeys:           userKeyMap,
 
 		AccessLogEnabled: cfg.AccessLogEnabled,
 	})
@@ -315,6 +334,9 @@ func (s *DGServer) UpdateUsers(users []*UserEntry) {
 	}
 	oldCount := s.userKeyMap.Len()
 	s.userKeyMap.Update(users)
+	if s.wgDevice != nil && s.wgDevice.bandwidth != nil {
+		s.wgDevice.bandwidth.updateUsers(users)
+	}
 	log.WithFields(log.Fields{
 		"old_users": oldCount,
 		"new_users": len(users),
